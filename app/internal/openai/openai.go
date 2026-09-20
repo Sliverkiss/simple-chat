@@ -123,9 +123,10 @@ type parseRaw struct {
 	Model       string          `json:"model"`
 	Messages    json.RawMessage `json:"messages"`
 	Stream      bool            `json:"stream"`
-	Temperature float64         `json:"temperature"`
-	TopP        float64         `json:"top_p"`
-	MaxTokens   int             `json:"max_tokens"`
+	Temperature        float64  `json:"temperature"`
+	TopP               float64  `json:"top_p"`
+	MaxTokens          int      `json:"max_tokens"`
+	MaxCompletionToken int      `json:"max_completion_tokens"`
 	Thinking    json.RawMessage `json:"thinking"`
 	Search      json.RawMessage `json:"search"`
 
@@ -186,13 +187,21 @@ func ParseRequest(body string) (*Request, error) {
 	if err != nil {
 		return nil, err
 	}
+	// max_completion_tokens is OpenAI's current name for the max_tokens
+	// knob (max_tokens is the deprecated alias). Map it onto MaxTokens,
+	// alias winning when both are present and nonzero — the effective
+	// limit the upstream pass-through emits (docs-upstream-params.md).
+	maxTokens := raw.MaxTokens
+	if raw.MaxCompletionToken > maxTokens {
+		maxTokens = raw.MaxCompletionToken
+	}
 	return &Request{
 		Model:           raw.Model,
 		Messages:        msgs,
 		Stream:          raw.Stream,
 		Temperature:     raw.Temperature,
 		TopP:            raw.TopP,
-		MaxTokens:       raw.MaxTokens,
+		MaxTokens:       maxTokens,
 		ThinkingEnabled: thinking,
 		SearchEnabled:   search,
 		Stripped:        stripped,
