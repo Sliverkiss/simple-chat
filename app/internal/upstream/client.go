@@ -637,31 +637,54 @@ func (c *Client) Completion(ctx context.Context, token string, req CompletionReq
 	// (qj1/sj1, kotlinx.serialization): the app's Json has
 	// encodeDefaults=true (ak5/bi5), so every field serializes every time —
 	// ref_file_ids: [] (empty array, not JSON null) when no files,
-	// thinking_enabled/search_enabled with their literal boolean values, and
-	// preempt unconditionally (apk-alignment.md I3, revised).
+	// thinking_enabled/search_enabled with their literal boolean values,
+	// preempt unconditionally, and the nullable audio_id/model_type/action
+	// as literal values (apk-alignment.md I3, revised;
+	// docs-spec-fingerprint-align.md).
+	//
+	// Field order is the kotlinx descriptor order (qj1.java:16-26), so the
+	// struct must stay in this exact declaration order — encoding/json
+	// emits struct fields in declaration order, matching the app. A map
+	// would sort keys alphabetically and break the fingerprint.
+	type completionBody struct {
+		ChatSessionID   string   `json:"chat_session_id"`
+		ParentMessageID *int     `json:"parent_message_id"`
+		Prompt          string   `json:"prompt"`
+		RefFileIDs      []string `json:"ref_file_ids"`
+		ThinkingEnabled bool     `json:"thinking_enabled"`
+		SearchEnabled   bool     `json:"search_enabled"`
+		AudioID         *string  `json:"audio_id"`
+		Preempt         bool     `json:"preempt"`
+		ModelType       string   `json:"model_type"`
+		Action          *string  `json:"action"`
+		Temperature     float64  `json:"temperature,omitempty"`
+		TopP            float64  `json:"top_p,omitempty"`
+		MaxTokens       int      `json:"max_tokens,omitempty"`
+	}
 	refFileIDs := req.RefFileIDs
 	if refFileIDs == nil {
 		refFileIDs = []string{}
 	}
-	payload := map[string]any{
-		"chat_session_id":   req.SessionID,
-		"parent_message_id": nil,
-		"prompt":            req.Prompt,
-		"ref_file_ids":      refFileIDs,
-		"thinking_enabled":  !req.ThinkingDisabled,
-		"search_enabled":    req.SearchEnabled,
-		"preempt":           false,
+	payload := completionBody{
+		ChatSessionID:   req.SessionID,
+		Prompt:          req.Prompt,
+		RefFileIDs:      refFileIDs,
+		ThinkingEnabled: !req.ThinkingDisabled,
+		SearchEnabled:   req.SearchEnabled,
+		// First-send flow (parent_message_id null): the app feeds model_type
+		// from the session's model-type state flow — "default" with
+		// expert/vision disabled (di1.java, docs-spec-fingerprint-align.md);
+		// audio_id is the literal null of the text-input path.
+		Preempt:     false,
+		ModelType:   "default",
+		Temperature: req.Temperature,
+		TopP:        req.TopP,
+		MaxTokens:   req.MaxTokens,
 	}
-	if req.Temperature != 0 {
-		payload["temperature"] = req.Temperature
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
 	}
-	if req.TopP != 0 {
-		payload["top_p"] = req.TopP
-	}
-	if req.MaxTokens != 0 {
-		payload["max_tokens"] = req.MaxTokens
-	}
-	body, _ := json.Marshal(payload)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.BaseURL+"/api/v0/chat/completion", bytes.NewReader(body))
 	if err != nil {
 		return nil, err

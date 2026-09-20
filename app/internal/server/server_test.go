@@ -24,6 +24,9 @@ type upstreamFixture struct {
 	// onCompletion, when set, is invoked with the decoded completion
 	// request body — tests inspect the exact prompt forwarded upstream.
 	onCompletion func(body map[string]any)
+	// onCompletionRaw, when set, is invoked with the raw completion body
+	// bytes — tests that assert on key order (map decoding loses it).
+	onCompletionRaw func(raw []byte)
 }
 
 func newUpstreamFixture(t *testing.T) *upstreamFixture {
@@ -64,8 +67,12 @@ func newUpstreamFixture(t *testing.T) *upstreamFixture {
 			return
 		}
 		f.completions.Add(1)
+		raw, _ := io.ReadAll(r.Body)
+		if f.onCompletionRaw != nil {
+			f.onCompletionRaw(raw)
+		}
 		var body map[string]any
-		json.NewDecoder(r.Body).Decode(&body)
+		json.Unmarshal(raw, &body)
 		if f.onCompletion != nil {
 			f.onCompletion(body)
 		}

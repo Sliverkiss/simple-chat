@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -48,6 +49,60 @@ func TestChatCompletionsSamplingParamsReachUpstream(t *testing.T) {
 	}
 	if up.completions.Load() != 1 {
 		t.Errorf("completions = %d, want 1", up.completions.Load())
+	}
+}
+
+// TestChatCompletionsUpstreamBodyGoldenOrder pins the raw upstream body
+// through the full OpenAI path (TASK_FINGERPRINT_ALIGN): the 10 app keys
+// in kotlinx descriptor order (qj1.java:16-26) with model_type "default"
+// and audio_id/action as literal nulls. Raw bytes, not a decoded map —
+// key order is the assertion.
+func TestChatCompletionsUpstreamBodyGoldenOrder(t *testing.T) {
+	var mu sync.Mutex
+	var raw []byte
+	up := newUpstreamFixture(t)
+	up.onCompletionRaw = func(b []byte) {
+		mu.Lock()
+		raw = b
+		mu.Unlock()
+	}
+	defer up.srv.Close()
+	srv := newTestServer(t, up.srv.URL)
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"deepseek-flash","stream":false,
+			"messages":[{"role":"user","content":"hello"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(raw) == 0 {
+		t.Fatal("no upstream body captured")
+	}
+	// The session id is server-generated ("sess1" in the fixture); assert
+	// the shape around it rather than pinning the full session id.
+	// Order-sensitive prefix up to the session id, then order-sensitive
+	// suffix after it.
+	prefix := `{"chat_session_id":"`
+	if !strings.HasPrefix(string(raw), prefix) {
+		t.Fatalf("body does not start with chat_session_id:\n%s", raw)
+	}
+	rest := string(raw)
+	for _, anchor := range []string{`"parent_message_id":null`, `"prompt":"`, `"ref_file_ids":[]`,
+		`"thinking_enabled":true`, `"search_enabled":false`, `"audio_id":null`,
+		`"preempt":false`, `"model_type":"default"`, `"action":null}`} {
+		idx := strings.Index(rest, anchor)
+		if idx < 0 {
+			t.Fatalf("anchor %s missing or out of order in body:\n%s", anchor, raw)
+		}
+		rest = rest[idx+len(anchor):]
 	}
 }
 

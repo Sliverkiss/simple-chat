@@ -87,6 +87,65 @@ func TestCompletionBodyEncodesDefaults(t *testing.T) {
 	}
 }
 
+// TestCompletionBodyGoldenOrder pins the full marshaled body shape and key
+// order against the app's kotlinx serialization (TASK_FINGERPRINT_ALIGN;
+// docs-spec-fingerprint-align.md). The app's descriptor order (qj1.java
+// 16-26) is: chat_session_id, parent_message_id, prompt, ref_file_ids,
+// thinking_enabled, search_enabled, audio_id, preempt, model_type, action —
+// with audio_id/action as literal nulls and model_type "default" on the
+// first-send flow (di1.java). Map decoding loses key order, so this test
+// asserts on the raw bytes.
+func TestCompletionBodyGoldenOrder(t *testing.T) {
+	var mu sync.Mutex
+	var raws [][]byte
+
+	m := newMock(map[string]func(w http.ResponseWriter, r *http.Request){
+		"/api/v0/chat/create_pow_challenge": func(w http.ResponseWriter, r *http.Request) {
+			writeEnvelope(w, 0, "", map[string]any{"challenge": solvableChallenge("/api/v0/chat/completion")})
+		},
+		"/api/v0/chat/completion": func(w http.ResponseWriter, r *http.Request) {
+			raw, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			raws = append(raws, raw)
+			mu.Unlock()
+			w.Header().Set("Content-Type", "text/event-stream")
+			io.WriteString(w, "data: {\"v\":\"ok\"}\n")
+			io.WriteString(w, "event: close\ndata: {}\n")
+		},
+	})
+	defer m.srv.Close()
+
+	c := m.client()
+	// Default send: no files, thinking on, search off, no sampling params.
+	s1, err := c.Completion(context.Background(), "tok1", CompletionRequest{SessionID: "s", Prompt: "p"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1.Close()
+	// Sampling params set: they must append after action, never reorder the
+	// app fields.
+	s2, err := c.Completion(context.Background(), "tok1", CompletionRequest{SessionID: "s", Prompt: "p",
+		Temperature: 0.7, TopP: 0.9, MaxTokens: 512})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(raws) != 2 {
+		t.Fatalf("captured %d bodies, want 2", len(raws))
+	}
+	wantDefault := `{"chat_session_id":"s","parent_message_id":null,"prompt":"p","ref_file_ids":[],"thinking_enabled":true,"search_enabled":false,"audio_id":null,"preempt":false,"model_type":"default","action":null}`
+	if string(raws[0]) != wantDefault {
+		t.Errorf("default body:\n got %s\nwant %s", raws[0], wantDefault)
+	}
+	wantSampling := `{"chat_session_id":"s","parent_message_id":null,"prompt":"p","ref_file_ids":[],"thinking_enabled":true,"search_enabled":false,"audio_id":null,"preempt":false,"model_type":"default","action":null,"temperature":0.7,"top_p":0.9,"max_tokens":512}`
+	if string(raws[1]) != wantSampling {
+		t.Errorf("sampling body:\n got %s\nwant %s", raws[1], wantSampling)
+	}
+}
+
 // TestCompletionBodySamplingParams pins the openai-compat pass-through
 // (apk-alignment.md K3): the app never sends sampling params, but the
 // upstream tolerates them and the gateway forwards them when nonzero
