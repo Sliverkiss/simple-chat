@@ -21,6 +21,9 @@ type upstreamFixture struct {
 	sessions    atomic.Int64
 	deletes     atomic.Int64
 	completions atomic.Int64
+	// onCompletion, when set, is invoked with the decoded completion
+	// request body — tests inspect the exact prompt forwarded upstream.
+	onCompletion func(body map[string]any)
 }
 
 func newUpstreamFixture(t *testing.T) *upstreamFixture {
@@ -63,6 +66,9 @@ func newUpstreamFixture(t *testing.T) *upstreamFixture {
 		f.completions.Add(1)
 		var body map[string]any
 		json.NewDecoder(r.Body).Decode(&body)
+		if f.onCompletion != nil {
+			f.onCompletion(body)
+		}
 		// App encoding (apk-alignment.md I3, revised): encodeDefaults
 		// always sends both flags as literal booleans.
 		if body["thinking_enabled"] != true || body["search_enabled"] != false {
@@ -76,6 +82,15 @@ func newUpstreamFixture(t *testing.T) *upstreamFixture {
 		io.WriteString(w, "event: close\ndata: {}\n")
 	})
 	f.srv = httptest.NewServer(mux)
+	return f
+}
+
+// newUpstreamFixtureWithCompletionHook is newUpstreamFixture plus a hook
+// invoked with the decoded completion body — tests inspect the exact
+// prompt the gateway forwarded upstream.
+func newUpstreamFixtureWithCompletionHook(t *testing.T, hook func(body map[string]any)) *upstreamFixture {
+	f := newUpstreamFixture(t)
+	f.onCompletion = hook
 	return f
 }
 

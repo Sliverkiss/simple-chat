@@ -109,9 +109,10 @@ type Request struct {
 	// absent) = false — search slows responses and is wrong for bulk text
 	// processing (web-search-research.md).
 	SearchEnabled bool
-	// Stripped lists what sanitization removed from this request — field
-	// names plus counters like "system_messages=2". Empty = nothing
-	// stripped. The server logs it as one debug line; nothing else.
+	// Stripped lists what sanitization removed or restructured in this
+	// request — field names plus counters like "system_messages=2" (system
+	// messages MERGED into the first user message, not dropped). Empty =
+	// nothing stripped. The server logs it as one debug line; nothing else.
 	Stripped []string
 }
 
@@ -152,8 +153,11 @@ type parseRaw struct {
 
 // ParseRequest decodes, sanitizes, and validates the request body.
 // Sanitization is silent by design (docs-spec-field-strip.md): the upstream
-// has no tool calling and no system role, so those fields are stripped —
-// never rejected — and what remains is exactly what the gateway can serve.
+// has no tool calling and no system role, so tool-calling fields are
+// stripped — never rejected — and system messages are merged into the
+// first user message rather than dropped (TASK_SYSTEM_MERGE), so clients
+// that ride prompt engineering on the system role keep working. What
+// remains is exactly what the gateway can serve.
 func ParseRequest(body string) (*Request, error) {
 	var raw parseRaw
 	if err := json.Unmarshal([]byte(body), &raw); err != nil {
@@ -170,7 +174,7 @@ func ParseRequest(body string) (*Request, error) {
 	msgs, stripped = sanitizeMessages(msgs, stripped)
 	if len(msgs) == 0 {
 		if len(stripped) > 0 {
-			return nil, errors.New("messages must not be empty (all messages were removed by sanitization: system role and tool calls are not supported)")
+			return nil, errors.New("messages must not be empty (all messages were removed by sanitization: tool calls are not supported and system messages had no usable content)")
 		}
 		return nil, errors.New("messages must not be empty")
 	}
@@ -235,18 +239,29 @@ func (raw *parseRaw) strippedFields() []string {
 	return stripped
 }
 
+// systemMergeSeparator sits between the merged system block and the
+// original first-user content: blocks are joined with a blank line, then
+// one "---" divider line separates instructions from the user turn
+// (docs-spec-field-strip.md).
+const systemMergeSeparator = "\n\n---\n\n"
+
 // sanitizeMessages applies the message-level rules: system messages are
-// dropped entirely; messages left with no content by tool-call stripping
-// are dropped; junk content-part types are removed at parse; name fields
-// are ignored at parse. Returns the surviving messages and the appended
-// strip report.
+// MERGED, not dropped — their contents are collected in order and
+// prepended to the first user message (or a new leading user message when
+// the conversation has none); messages left with no content by tool-call
+// stripping are dropped; junk content-part types are removed at parse;
+// name fields are ignored at parse. Returns the surviving messages and
+// the appended strip report.
 func sanitizeMessages(msgs []Message, stripped []string) ([]Message, []string) {
-	systemCount, emptyToolCount, junkPartCount, nameCount := 0, 0, 0, 0
+	var systemBlocks []string
+	emptyToolCount, junkPartCount, nameCount := 0, 0, 0
 	out := make([]Message, 0, len(msgs))
 	for _, m := range msgs {
 		switch {
 		case m.Role == "system":
-			systemCount++
+			if text := m.systemText(); text != "" {
+				systemBlocks = append(systemBlocks, text)
+			}
 			continue
 		case (m.Role == "assistant" || m.Role == "tool") && m.Content == "" && len(m.ContentParts) == 0:
 			// An assistant carrier with only tool_calls, or an empty tool
@@ -260,8 +275,9 @@ func sanitizeMessages(msgs []Message, stripped []string) ([]Message, []string) {
 		nameCount += boolToInt(m.hasName)
 		out = append(out, m)
 	}
-	if systemCount > 0 {
-		stripped = append(stripped, fmt.Sprintf("system_messages=%d", systemCount))
+	if len(systemBlocks) > 0 {
+		out = mergeSystemBlocks(out, strings.Join(systemBlocks, "\n\n"))
+		stripped = append(stripped, fmt.Sprintf("system_messages=%d", len(systemBlocks)))
 	}
 	if emptyToolCount > 0 {
 		stripped = append(stripped, fmt.Sprintf("tool_messages=%d", emptyToolCount))
@@ -273,6 +289,48 @@ func sanitizeMessages(msgs []Message, stripped []string) ([]Message, []string) {
 		stripped = append(stripped, fmt.Sprintf("message_names=%d", nameCount))
 	}
 	return out, stripped
+}
+
+// systemText renders a system message's usable content: the plain string
+// when present, otherwise its text parts joined with newlines. Empty
+// result means the message carries nothing worth merging.
+func (m Message) systemText() string {
+	if m.Content != "" {
+		return m.Content
+	}
+	var texts []string
+	for _, p := range m.ContentParts {
+		if p.Type == "text" && p.Text != "" {
+			texts = append(texts, p.Text)
+		}
+	}
+	return strings.Join(texts, "\n")
+}
+
+// mergeSystemBlocks prepends the merged system text to the first user
+// message, separated by systemMergeSeparator. A conversation without a
+// user message gets a new leading user message carrying only the system
+// text — a system-only transcript is valid input (TASK_SYSTEM_MERGE).
+// The separator is omitted when the user message has nothing to separate
+// from (empty string content and no parts).
+func mergeSystemBlocks(out []Message, system string) []Message {
+	for i := range out {
+		if out[i].Role != "user" {
+			continue
+		}
+		switch {
+		case out[i].Content != "":
+			out[i].Content = system + systemMergeSeparator + out[i].Content
+		case len(out[i].ContentParts) > 0:
+			out[i].Content = system + systemMergeSeparator
+		default:
+			out[i].Content = system
+		}
+		return out
+	}
+	merged := make([]Message, 0, len(out)+1)
+	merged = append(merged, Message{Role: "user", Content: system})
+	return append(merged, out...)
 }
 
 // boolToInt keeps sanitizeMessages free of an if per flag.

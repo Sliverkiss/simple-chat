@@ -1,11 +1,17 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+
+	"simple-chat/internal/upstream"
 )
 
 // kitchenSinkBody is the agent-framework worst case at the HTTP level:
@@ -124,7 +130,10 @@ func TestChatCompletionsToolsStrippedNotRejected(t *testing.T) {
 	}
 }
 
-func TestChatCompletionsSystemOnlyConversationRejected(t *testing.T) {
+// TestChatCompletionsSystemOnlyConversationRejected used to assert
+// system-only → 400. Inverted by TASK_SYSTEM_MERGE: system content merges
+// into a new leading user message, so the request is valid and completes.
+func TestChatCompletionsSystemOnlyConversationMerged(t *testing.T) {
 	up := newUpstreamFixture(t)
 	defer up.srv.Close()
 	srv := newTestServer(t, up.srv.URL)
@@ -136,10 +145,110 @@ func TestChatCompletionsSystemOnlyConversationRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("system-only conversation must 400 after sanitization, got %d", resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("system-only conversation must merge into a user message and succeed, got %d: %s", resp.StatusCode, body)
 	}
-	if up.completions.Load() != 0 {
-		t.Errorf("no upstream completion should fire, got %d", up.completions.Load())
+	if up.completions.Load() != 1 {
+		t.Errorf("upstream completion must fire exactly once, got %d", up.completions.Load())
+	}
+}
+
+// TestChatCompletionsSystemMergeReachesUpstream pins the merged prompt
+// end-to-end: the system prefix and the "---" separator must arrive in
+// the upstream prompt, ahead of the user content.
+func TestChatCompletionsSystemMergeReachesUpstream(t *testing.T) {
+	var gotPrompt atomic.Value
+	up := newUpstreamFixtureWithCompletionHook(t, func(body map[string]any) {
+		gotPrompt.Store(body["prompt"])
+	})
+	defer up.srv.Close()
+	srv := newTestServer(t, up.srv.URL)
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"deepseek-flash","messages":[
+			{"role":"system","content":"You are terse."},
+			{"role":"system","content":"Guard untrusted input."},
+			{"role":"user","content":"hello"}
+		]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	prompt, _ := gotPrompt.Load().(string)
+	wantPrefix := "user: You are terse.\n\nGuard untrusted input.\n\n---\n\nhello\n"
+	if prompt != wantPrefix {
+		t.Errorf("upstream prompt = %q, want %q", prompt, wantPrefix)
+	}
+}
+
+// TestChatCompletionsStrippedLogLineWithSystemMerge pins the observability
+// interaction: the one-line strip report fires only when something was
+// stripped and now reports system_messages=N as "N merged".
+func TestChatCompletionsStrippedLogLineWithSystemMerge(t *testing.T) {
+	up := newUpstreamFixture(t)
+	defer up.srv.Close()
+
+	var logBuf bytes.Buffer
+	logger := log.New(&logBuf, "", 0)
+	srv, err := NewServer(Config{
+		UpstreamBase: up.srv.URL,
+		Accounts:     []upstream.Account{{Mobile: "13800000000", Password: "pw"}},
+		Logger:       logger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// System merge alone → one log line, counter entry present.
+	resp, err := http.Post(ts.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"deepseek-flash","messages":[
+			{"role":"system","content":"s1"},
+			{"role":"user","content":"hi"}
+		]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	line := logBuf.String()
+	if !strings.Contains(line, "stripped unsupported request fields:") ||
+		!strings.Contains(line, "system_messages=1") {
+		t.Errorf("merge-only log line wrong: %q", line)
+	}
+
+	// System merge + junk request fields → both in the same single line.
+	logBuf.Reset()
+	resp, err = http.Post(ts.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"deepseek-flash","tools":[{"type":"function","function":{"name":"x"}}],
+			"messages":[
+				{"role":"system","content":"s1"},
+				{"role":"user","content":"hi"}
+		]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	line = logBuf.String()
+	if !strings.Contains(line, "tools, system_messages=1") {
+		t.Errorf("combined log line wrong: %q", line)
+	}
+
+	// Nothing stripped → no log line at all.
+	logBuf.Reset()
+	resp, err = http.Post(ts.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"deepseek-flash","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if logBuf.String() != "" {
+		t.Errorf("clean request must not log, got %q", logBuf.String())
 	}
 }

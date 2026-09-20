@@ -99,9 +99,10 @@ func TestParseRequestKitchenSink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Exactly what survives the sanitizer.
+	// Exactly what survives the sanitizer. The two system messages are merged
+	// into the first user message as a prefix; everything else is unchanged.
 	assertMessages(t, req, []msgExpect{
-		{Role: "user", Content: "hello"},
+		{Role: "user", Content: "You are terse.\n\nSecond system." + systemMergeFormat + "hello"},
 		{Role: "assistant", Content: "partial answer"},
 		{Role: "tool", Content: "tool result text"},
 		{Role: "user", Parts: []ContentPart{
@@ -155,7 +156,12 @@ func TestParseRequestNullJunkFieldsNotReported(t *testing.T) {
 	}
 }
 
-func TestParseRequestDropsAllSystemMessages(t *testing.T) {
+// systemMergeFormat pins the deterministic merge layout:
+// system blocks joined with a blank line, then a "---" separator line,
+// then the original first-user content.
+const systemMergeFormat = "\n\n---\n\n"
+
+func TestParseRequestMergesAllSystemMessagesIntoFirstUser(t *testing.T) {
 	req, err := ParseRequest(`{"model": "deepseek-flash", "messages": [
 		{"role": "system", "content": "s1"},
 		{"role": "user", "content": "u1"},
@@ -168,20 +174,148 @@ func TestParseRequestDropsAllSystemMessages(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertMessages(t, req, []msgExpect{
-		{Role: "user", Content: "u1"},
+		{Role: "user", Content: "s1" + "\n\n" + "s2" + "\n\n" + "s3" + systemMergeFormat + "u1"},
 		{Role: "assistant", Content: "a1"},
 		{Role: "user", Content: "u2"},
 	})
 	assertStripped(t, req, "system_messages=3")
 }
 
-func TestParseRequestSystemOnlyErrors(t *testing.T) {
-	_, err := ParseRequest(`{"model": "deepseek-flash", "messages": [{"role": "system", "content": "only"}]}`)
-	if err == nil {
-		t.Fatal("system-only conversation must error after sanitization")
+// systemMergeTable covers the merge edge cases: multiple system messages,
+// system-only conversations (now valid), interleaved system messages, empty
+// system content, and multipart system content.
+func TestParseRequestSystemMergeTable(t *testing.T) {
+	tests := []struct {
+		name      string
+		body      string
+		wantMsgs  []msgExpect
+		wantCount string // "" = no system_messages entry expected
+		wantErr   string // "" = expect success
+	}{
+		{
+			name: "multiple system messages merge in original order",
+			body: `{"model": "deepseek-flash", "messages": [
+				{"role": "system", "content": "first"},
+				{"role": "system", "content": "second"},
+				{"role": "user", "content": "question"}
+			]}`,
+			wantMsgs: []msgExpect{
+				{Role: "user", Content: "first\n\nsecond" + systemMergeFormat + "question"},
+			},
+			wantCount: "system_messages=2",
+		},
+		{
+			name: "system-only conversation becomes a user message",
+			body: `{"model": "deepseek-flash", "messages": [
+				{"role": "system", "content": "only system"}
+			]}`,
+			wantMsgs: []msgExpect{
+				{Role: "user", Content: "only system"},
+			},
+			wantCount: "system_messages=1",
+		},
+		{
+			name: "system between user turns still merges into the first user",
+			body: `{"model": "deepseek-flash", "messages": [
+				{"role": "user", "content": "u1"},
+				{"role": "system", "content": "mid"},
+				{"role": "assistant", "content": "a1"},
+				{"role": "user", "content": "u2"}
+			]}`,
+			wantMsgs: []msgExpect{
+				{Role: "user", Content: "mid" + systemMergeFormat + "u1"},
+				{Role: "assistant", Content: "a1"},
+				{Role: "user", Content: "u2"},
+			},
+			wantCount: "system_messages=1",
+		},
+		{
+			name: "empty system content skipped without counting",
+			body: `{"model": "deepseek-flash", "messages": [
+				{"role": "system", "content": ""},
+				{"role": "system", "content": "real"},
+				{"role": "user", "content": "q"}
+			]}`,
+			wantMsgs: []msgExpect{
+				{Role: "user", Content: "real" + systemMergeFormat + "q"},
+			},
+			wantCount: "system_messages=1",
+		},
+		{
+			name: "multipart system content concatenates text parts",
+			body: `{"model": "deepseek-flash", "messages": [
+				{"role": "system", "content": [
+					{"type": "text", "text": "part one"},
+					{"type": "text", "text": "part two"}
+				]},
+				{"role": "user", "content": "q"}
+			]}`,
+			wantMsgs: []msgExpect{
+				{Role: "user", Content: "part one\npart two" + systemMergeFormat + "q"},
+			},
+			wantCount: "system_messages=1",
+		},
+		{
+			name: "system with only junk parts is skipped",
+			body: `{"model": "deepseek-flash", "messages": [
+				{"role": "system", "content": [
+					{"type": "audio", "audio": "x"}
+				]},
+				{"role": "user", "content": "q"}
+			]}`,
+			wantMsgs: []msgExpect{
+				{Role: "user", Content: "q"},
+			},
+			wantCount: "",
+		},
+		{
+			name: "all system messages empty still errors",
+			body: `{"model": "deepseek-flash", "messages": [
+				{"role": "system", "content": ""}
+			]}`,
+			wantErr: "messages must not be empty",
+		},
+		{
+			name: "no user message: system merges into new leading user message",
+			body: `{"model": "deepseek-flash", "messages": [
+				{"role": "system", "content": "s1"},
+				{"role": "assistant", "content": "a1"},
+				{"role": "system", "content": "s2"}
+			]}`,
+			wantMsgs: []msgExpect{
+				{Role: "user", Content: "s1\n\ns2"},
+				{Role: "assistant", Content: "a1"},
+			},
+			wantCount: "system_messages=2",
+		},
 	}
-	if !strings.Contains(err.Error(), "messages must not be empty") {
-		t.Errorf("error should reuse the empty-messages message: %v", err)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := ParseRequest(tt.body)
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got success: %+v", tt.wantErr, req.Messages)
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("error %q does not contain %q", err.Error(), tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			assertMessages(t, req, tt.wantMsgs)
+			if tt.wantCount == "" {
+				for _, s := range req.Stripped {
+					if strings.HasPrefix(s, "system_messages") {
+						t.Errorf("unexpected stripped entry %q", s)
+					}
+				}
+			} else {
+				assertStripped(t, req, tt.wantCount)
+			}
+		})
 	}
 }
 
