@@ -1,0 +1,31 @@
+# compiled binary (web search probe tool, 7.8MB ELF)
+searchprobe
+
+# --- secrets & credentials (NEVER commit) ---
+.env
+accounts.json
+session.json
+
+# --- local working docs & task briefs (internal, untracked) ---
+TASK_*.md
+*-research.md
+*-analysis.md
+*-behavior.md
+*-alignment.md
+audit.md
+spec.md
+docs-spec-*.md
+
+# --- local agent run logs ---
+claude_*.log
+
+# --- local recon data ---
+recon-data/
+
+# --- local smoke test scratch ---
+smoke/
+
+# --- local build artifacts ---
+simple-chat
+simple-chat.sh
+simple-chat-*-linux-*

@@ -1,0 +1,7 @@
+providers = ["go"]
+
+[phases.build]
+cmds = ["go build -o app ."]
+
+[start]
+cmd = "./app"

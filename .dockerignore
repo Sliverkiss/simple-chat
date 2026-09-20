@@ -1,0 +1,5 @@
+app/recon-data
+app/smoke
+app/*.log
+app/TASK*.md
+searchprobe

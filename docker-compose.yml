@@ -1,0 +1,15 @@
+services:
+  simple-chat:
+    build: .
+    ports:
+      - "9879:8080"
+    volumes:
+      # The file must be readable AND writable by uid 65532 (distroless
+      # nonroot, persists per-account device ids on first boot) AND have 0600
+      # perms: chown 65532:65532 accounts.json && chmod 600 accounts.json
+      - ./accounts.json:/app/accounts.json
+    environment:
+      - DS_ACCOUNTS=/app/accounts.json
+      - DS_ADDR=:8080
+      - DS_API_KEY=${DS_API_KEY:-}
+    restart: unless-stopped

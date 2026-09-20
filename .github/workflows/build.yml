@@ -1,0 +1,84 @@
+name: build-installer
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - 'app/**'
+      - 'scripts/**'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # tag builds create a GitHub Release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Test
+        working-directory: app
+        run: go test ./... -count=1
+
+      - name: Build installer
+        run: scripts/build-installer.sh dist/simple-chat.sh
+
+      - name: sha256 (log traceability)
+        run: sha256sum dist/simple-chat.sh
+
+      # Verification gate: the installer must actually deploy a working
+      # gateway before it is published. First run writes the .env template
+      # and exits; fill a minimal env, re-run, poll /healthz.
+      - name: Verify installer end-to-end
+        run: |
+          set -eu
+          mkdir /tmp/deploy && cd /tmp/deploy
+          cp "$GITHUB_WORKSPACE/dist/simple-chat.sh" .
+          # First run: template + exit 0.
+          sh ./simple-chat.sh
+          test -f ./.env
+          # Minimal config: explicit port, no API key (open auth for the probe).
+          sed -i 's/^DS_ADDR=:8080/DS_ADDR=:18080/' .env
+          # Second run: extract + serve in background.
+          sh ./simple-chat.sh > server.log 2>&1 &
+          SERVER_PID=$!
+          cleanup() { kill "$SERVER_PID" 2>/dev/null || true; }
+          trap cleanup EXIT
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -sf -m 2 http://127.0.0.1:18080/healthz > /dev/null; then
+              echo "healthz OK after ${i}s"
+              ok=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ok" != 1 ]; then
+            echo "healthz never answered" >&2
+            cat server.log >&2
+            exit 1
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: simple-chat-installer
+          path: dist/simple-chat.sh
+          if-no-files-found: error
+
+      - name: Release (tag builds only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          gh release create "$TAG" dist/simple-chat.sh \
+            --title "simple-chat $TAG" \
+            --notes "Self-extracting installer (linux amd64 + arm64). Run \`bash simple-chat.sh\` on the target host; see the script header for what it does."
+        env:
+          GH_TOKEN: ${{ github.token }}
