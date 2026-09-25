@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src=".github/logo.png" width="160" alt="simple-chat logo"/>
+<img src="IMG_8921.png" width="160" alt="simple-chat logo"/>
 
 # simple-chat
 
