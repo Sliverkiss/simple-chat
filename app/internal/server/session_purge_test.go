@@ -9,9 +9,14 @@ package server
 
 import (
 	"context"
+	"io"
+	"log"
 	"math/rand"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"simple-chat/internal/upstream"
 )
 
 // purgeCfgSunday4 is the canonical test config: Sunday 04:00.
@@ -300,9 +305,52 @@ func TestPurgeShutdownDrainsCleanly(t *testing.T) {
 	gw.Shutdown() // idempotent
 }
 
+// TestPurgeOverrideConsumedAfterFire: the injected override drives exactly
+// one background fire, then the loop returns to the weekly cadence — a
+// stale override must never turn the loop into a delete_all busy loop —
+// and shutdown drains immediately.
+func TestPurgeOverrideConsumedAfterFire(t *testing.T) {
+	var passes atomic.Int64
+	s := newPurgeScheduler(purgeConfig{
+		weekday:    6,
+		hour:       4,
+		jitter:     time.Second,
+		catchUpMin: 2 * time.Millisecond,
+		catchUpMax: 12 * time.Millisecond,
+	}, nil, nil, log.New(io.Discard, "", 0))
+	s.accounts = func() []upstream.AccountRef {
+		passes.Add(1)
+		return nil
+	}
+	s.start()
+	shutdownDone := make(chan struct{})
+	defer func() {
+		go func() {
+			s.shutdown()
+			close(shutdownDone)
+		}()
+		select {
+		case <-shutdownDone:
+		case <-time.After(2 * time.Second):
+			t.Log("purge scheduler did not drain: loop still storming")
+		}
+	}()
+
+	s.overrideNextUnix.Store(time.Now().Add(50 * time.Millisecond).Unix())
+	time.Sleep(700 * time.Millisecond)
+	n := passes.Load()
+	if n < 1 {
+		t.Fatalf("override never fired a purge pass (passes=%d)", n)
+	}
+	if n > 4 {
+		t.Fatalf("override fired %d purge passes in 700ms — a consumed override must stop after ~1 (one-shot)", n)
+	}
+}
+
 // TestPurgeLoopFiresOnShortDelay: with an injected near-immediate next
-// purge, the background loop fires a purge without manual intervention,
-// and continues firing (the override is honored on every re-read).
+// purge, the background loop fires a purge without manual intervention;
+// the override is consumed by that fire, so the loop returns to its
+// weekly cadence.
 func TestPurgeLoopFiresOnShortDelay(t *testing.T) {
 	f := newCleanupFixture(t)
 	gw, ts := newCleanupServer(t, f.srv.URL, func(c *Config) {
