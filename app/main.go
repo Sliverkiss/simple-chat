@@ -216,7 +216,16 @@ func main() {
 	log.Printf("simple-chat listening on %s (model: deepseek-flash, account store: %s, accounts: %d, max in-flight/account: %d, reasoning: on (default), per-request opt-out, %s, %s)",
 		addr, storeName, len(accounts), maxInflight, authMode, sessionMode)
 
-	httpSrv := &http.Server{Addr: addr, Handler: srv.Handler()}
+	// ReadHeaderTimeout caps header reads so slow-loris clients cannot park
+	// a connection (and a goroutine) indefinitely on the open-access
+	// surface (DS_API_KEY unset). IdleTimeout bounds keep-alive idleness.
+	// Neither limits in-flight SSE responses, which are writes, not reads.
+	httpSrv := &http.Server{
+		Addr:              addr,
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 
 	// Graceful shutdown: SIGTERM/SIGINT stops accepting, in-flight responses
 	// finish (bounded), then pending async session deletes drain (bounded).
