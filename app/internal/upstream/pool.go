@@ -569,13 +569,16 @@ func (p *Pool) Status() []map[string]any {
 		case healthRisk:
 			state = "risk"
 		}
+		pa.am.mu.Lock()
+		parkUntil := pa.am.parkUntil.Format(time.RFC3339)
+		pa.am.mu.Unlock()
 		out = append(out, map[string]any{
 			"mobile":     pa.account.Mobile,
 			"region":     pa.account.normalizedRegion(),
 			"state":      state,
 			"inflight":   len(pa.slots),
 			"max":        cap(pa.slots),
-			"park_until": pa.am.parkUntil.Format(time.RFC3339),
+			"park_until": parkUntil,
 		})
 	}
 	return out
