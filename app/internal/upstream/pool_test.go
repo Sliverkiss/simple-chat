@@ -391,3 +391,47 @@ func TestPoolStatusMutedAndBanned(t *testing.T) {
 		t.Errorf("acct 1 state = %q, want banned", states["13800000001"])
 	}
 }
+
+// TestPoolStatusConcurrentWithParkRace: Status() must hold the account
+// mutex when reading parkUntil (the park write side — NoteError — writes
+// it under am.mu). Run under -race to prove there is no data race between
+// concurrent Status() readers and park writers.
+func TestPoolStatusConcurrentWithParkRace(t *testing.T) {
+	pool := newTestPool(t, 2, 5, nil)
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				pool.Status()
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			lease, err := pool.Acquire(context.Background())
+			if err != nil {
+				continue
+			}
+			lease.NoteError(&BizError{BizCode: 5, BizMsg: "user is muted", MuteUntil: time.Now().Add(time.Minute)})
+			lease.Release()
+		}
+	}()
+	time.Sleep(300 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+}
