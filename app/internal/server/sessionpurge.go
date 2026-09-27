@@ -114,9 +114,11 @@ type purgeScheduler struct {
 	rng *rand.Rand
 
 	// overrideNextUnix, when non-zero, replaces the computed next fire
-	// time (test seam for driving the background loop). Read freshly
-	// on every wait slice so a late override takes effect; atomic
-	// because the test writes it while the loop goroutine runs.
+	// time for exactly one background fire (test seam for driving the
+	// loop). Read freshly on every wait slice so a late override takes
+	// effect; the loop clears it after each fire, so a stale past
+	// override can never re-fire the loop. Atomic because the test
+	// writes it while the loop goroutine runs.
 	overrideNextUnix atomic.Int64
 
 	// started records that the loop goroutine was launched (enabled).
@@ -202,6 +204,12 @@ func (s *purgeScheduler) loop() {
 			}
 		}
 		s.pass(context.Background())
+		// Consume the test override: it drives exactly this next fire and
+		// no more. Without this, a stale past override would re-fire the
+		// inner loop instantly forever, ignoring s.stop (which is only
+		// read inside the sleep select) — a delete_all busy loop that
+		// shutdown() can never drain.
+		s.overrideNextUnix.Store(0)
 	}
 }
 
