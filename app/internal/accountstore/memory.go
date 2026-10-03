@@ -32,6 +32,12 @@ type MemoryFirstStore struct {
 	backing Store
 	logger  *log.Logger
 
+	// mu serializes the entire backing-write/cache-update operation, not just
+	// map access. A delete/re-add cannot overtake an in-flight login or park
+	// write for the old account. Backing Store methods must not call back into
+	// this wrapper while a write is in progress (the production stores do not).
+	// Never acquire a pool/account-manager lock while holding mu: persistence
+	// callbacks enter here with the account lock already held.
 	mu       sync.Mutex
 	accounts map[string]upstream.Account // keyed by Identity()
 }
@@ -72,24 +78,24 @@ func (s *MemoryFirstStore) Load(ctx context.Context) ([]upstream.Account, error)
 // and the cache stays untouched — the admin API answers 5xx honestly), then
 // the cache follows.
 func (s *MemoryFirstStore) SaveAccount(ctx context.Context, acct upstream.Account) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := s.backing.SaveAccount(ctx, acct); err != nil {
 		return err
 	}
-	s.mu.Lock()
 	s.accounts[acct.Identity()] = acct
-	s.mu.Unlock()
 	return nil
 }
 
 // DeleteAccount removes one record from the backing first
 // (ErrAccountNotFound propagates), then from the cache.
 func (s *MemoryFirstStore) DeleteAccount(ctx context.Context, identity string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := s.backing.DeleteAccount(ctx, identity); err != nil {
 		return err
 	}
-	s.mu.Lock()
 	delete(s.accounts, identity)
-	s.mu.Unlock()
 	return nil
 }
 
@@ -112,8 +118,9 @@ func (s *MemoryFirstStore) ApplyPark(rec upstream.ParkRecord) {
 		return // already persisted exactly this state
 	}
 	s.accounts[rec.Mobile] = acct
+	err := s.backing.SaveAccount(context.Background(), acct)
 	s.mu.Unlock()
-	if err := s.backing.SaveAccount(context.Background(), acct); err != nil {
+	if err != nil {
 		logf(s.logger, "memory-first store: cannot persist park state for %s: %v", rec.Mobile, err)
 	}
 }
@@ -132,8 +139,9 @@ func (s *MemoryFirstStore) ApplyLogin(rec upstream.LoginRecord) {
 	}
 	acct.SessionToken = rec.Token
 	s.accounts[rec.Identity] = acct
+	err := s.backing.SaveAccount(context.Background(), acct)
 	s.mu.Unlock()
-	if err := s.backing.SaveAccount(context.Background(), acct); err != nil {
+	if err != nil {
 		logf(s.logger, "memory-first store: cannot persist session token for %s: %v", rec.Identity, err)
 	}
 }

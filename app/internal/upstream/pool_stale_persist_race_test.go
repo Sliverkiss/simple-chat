@@ -15,13 +15,14 @@ import (
 )
 
 // gatedBacking pauses the OLD generation's actual upsert, not the login
-// response or the pool's active check. The cache can therefore be deleted and
-// recreated while an already-admitted write is in flight.
+// response or the pool's active check. A serialized store must complete that
+// upsert before a concurrent delete/re-add can reach the backing store.
 type gatedBacking struct {
 	mu       sync.Mutex
 	accounts map[string]upstream.Account
 	oldWrite chan struct{}
 	resume   chan struct{}
+	writes   chan string // ordered backing mutations, emitted while holding mu
 }
 
 func (s *gatedBacking) Load(context.Context) ([]upstream.Account, error) {
@@ -41,6 +42,7 @@ func (s *gatedBacking) SaveAccount(_ context.Context, a upstream.Account) error 
 	}
 	s.mu.Lock()
 	s.accounts[a.Identity()] = a
+	s.writes <- "save:" + a.SessionToken
 	s.mu.Unlock()
 	return nil
 }
@@ -52,6 +54,7 @@ func (s *gatedBacking) DeleteAccount(_ context.Context, id string) error {
 		return accountstore.ErrAccountNotFound
 	}
 	delete(s.accounts, id)
+	s.writes <- "delete"
 	return nil
 }
 
@@ -66,6 +69,7 @@ func TestPoolInflightLoginPersistenceCannotOverwriteReaddedAccount(t *testing.T)
 		accounts: map[string]upstream.Account{id: {Mobile: id, Password: "old-password"}},
 		oldWrite: make(chan struct{}),
 		resume:   make(chan struct{}),
+		writes:   make(chan string, 4),
 	}
 	var resumeOnce sync.Once
 	resumeOld := func() { resumeOnce.Do(func() { close(backing.resume) }) }
@@ -111,15 +115,45 @@ func TestPoolInflightLoginPersistenceCannotOverwriteReaddedAccount(t *testing.T)
 	if !pool.RemoveAccount(id) {
 		t.Fatal("old account not removed from pool")
 	}
-	if err := store.DeleteAccount(ctx, id); err != nil {
-		t.Fatal(err)
-	}
 	freshAccount := upstream.Account{Mobile: id, Password: "new-password"}
-	if err := store.SaveAccount(ctx, freshAccount); err != nil {
-		t.Fatal(err)
+	mutationStarted := make(chan struct{})
+	mutationResult := make(chan error, 1)
+	go func() {
+		close(mutationStarted)
+		if err := store.DeleteAccount(ctx, id); err != nil {
+			mutationResult <- fmt.Errorf("delete: %w", err)
+			return
+		}
+		if err := store.SaveAccount(ctx, freshAccount); err != nil {
+			mutationResult <- fmt.Errorf("re-add save: %w", err)
+			return
+		}
+		mutationResult <- pool.AddAccount(freshAccount)
+	}()
+	select {
+	case <-mutationStarted:
+	case <-ctx.Done():
+		t.Fatalf("delete/re-add did not start: %v", ctx.Err())
 	}
-	if err := pool.AddAccount(freshAccount); err != nil {
-		t.Fatal(err)
+	// The old backing write is already admitted. Release it while the
+	// delete/re-add is concurrent; store serialization must order old, delete,
+	// then new. Waiting for DeleteAccount before release would deadlock.
+	resumeOld()
+	select {
+	case err := <-mutationResult:
+		if err != nil {
+			t.Fatalf("delete/re-add: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("delete/re-add did not complete: %v", ctx.Err())
+	}
+	select {
+	case result := <-oldResult:
+		if result.err != nil || result.token != "token-1" {
+			t.Fatalf("old login token mismatch: %v", result.err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("old persistence did not complete: %v", ctx.Err())
 	}
 	fresh, err := pool.Acquire(ctx)
 	if err != nil {
@@ -127,16 +161,17 @@ func TestPoolInflightLoginPersistenceCannotOverwriteReaddedAccount(t *testing.T)
 	}
 	defer fresh.Release()
 	if token, err := fresh.Token(ctx); err != nil || token != "token-2" {
-		t.Fatalf("new generation login = %q, %v; want token-2", token, err)
+		t.Fatalf("new generation login token mismatch: %v", err)
 	}
-	resumeOld() // force stale backing write AFTER the new generation's write
-	select {
-	case result := <-oldResult:
-		if result.err != nil || result.token != "token-1" {
-			t.Fatalf("old login = %+v; want token-1", result)
+	for _, want := range []string{"save:token-1", "delete", "save:", "save:token-2"} {
+		select {
+		case got := <-backing.writes:
+			if got != want {
+				t.Fatalf("backing mutation order: got %q, want %q", got, want)
+			}
+		case <-ctx.Done():
+			t.Fatalf("backing mutation %q missing: %v", want, ctx.Err())
 		}
-	case <-ctx.Done():
-		t.Fatalf("old persistence did not complete: %v", ctx.Err())
 	}
 	rows, err := backing.Load(ctx)
 	if err != nil {
