@@ -1,7 +1,5 @@
-// Multi-account pool: strict round-robin selection, per-account in-flight
-// caps, and health states (banned / muted / risk-device). Ideas lifted from
-// the ds2api account pool and snake-aabb-wtf idle/busy/error states; the bloat
-// was not invited.
+// Multi-account pool: per-physical-identity in-flight caps, scored selection,
+// and shared health states (banned / muted / risk-device) across duplicate rows.
 package upstream
 
 import (
@@ -179,7 +177,8 @@ type Pool struct {
 
 	mu      sync.Mutex
 	rng     *rand.Rand
-	nextSeq int // round-robin sequence counter (debug/introspection)
+	// nextSeq counts successful acquisitions for introspection.
+	nextSeq int
 }
 
 // NewPool validates accounts and builds the ring. An empty ring is valid
@@ -405,10 +404,10 @@ func (pa *poolAccount) isBusy() bool {
 	return len(pa.slots) >= cap(pa.slots)
 }
 
-// Acquire selects a uniformly random ready account with free capacity and
-// reserves a slot. The random draw is made while holding p.mu, so concurrent
-// requests cannot race the PRNG or account slice. If all candidates are busy,
-// wait up to cfg.QueueWait; if all are banned, fail immediately.
+// Acquire scores ready identities with free capacity and reserves a slot.
+// A random draw among near-best candidates is serialized under p.mu.
+// If all candidates are busy, wait up to QueueWait; if none can recover,
+// fail immediately.
 func (p *Pool) Acquire(ctx context.Context) (*Lease, error) {
 	lease, _, err := p.AcquireWithWait(ctx)
 	return lease, err
