@@ -296,14 +296,14 @@ func (p *Pool) buildAccount(a Account) (*poolAccount, error) {
 		pa.am.ban = BanBanned
 		pa.am.banMsg = a.ParkReason
 		pa.am.mu.Unlock()
-		p.logf("pool: %s still BANNED (restored from disk; manual revive = delete park fields from accounts.json)", a.Identity())
+		p.logf("pool: account still BANNED (restored from disk; manual revive = delete park fields from accounts.json)")
 	} else if kind != BanNone && !until.IsZero() && !time.Now().After(until) {
 		pa.am.mu.Lock()
 		pa.am.ban = kind
 		pa.am.parkUntil = until
 		pa.am.banMsg = a.ParkReason
 		pa.am.mu.Unlock()
-		p.logf("pool: %s still %s until %s (restored from disk)", a.Identity(), banName(kind), until.Format(time.RFC3339))
+		p.logf("pool: account still %s until %s (restored from disk)", banName(kind), until.Format(time.RFC3339))
 	}
 	return pa, nil
 }
@@ -372,7 +372,7 @@ func (p *Pool) AddAccount(a Account) error {
 			tr.MaxIdleConnsPerHost = want
 		}
 	}
-	p.logf("pool: hot-added %s (ring now %d)", a.Identity(), len(p.accounts))
+	p.logf("pool: hot-added account (ring now %d)", len(p.accounts))
 	return nil
 }
 
@@ -402,7 +402,7 @@ func (p *Pool) RemoveAccount(id string) bool {
 		return false
 	}
 	p.accounts = kept
-	p.logf("pool: removed %s (%d slot(s), ring now %d)", id, removed, len(p.accounts))
+	p.logf("pool: removed account (%d slot(s), ring now %d)", removed, len(p.accounts))
 	return true
 }
 

@@ -143,7 +143,7 @@ func (s *MemoryFirstStore) ApplyPark(rec upstream.ParkRecord) {
 	acct, ok := s.accounts[rec.Mobile]
 	if !ok || !s.acceptsGeneration(rec.Mobile, rec.Generation) {
 		s.mu.Unlock()
-		logf(s.logger, "memory-first store: park for unknown or stale identity %s skipped", rec.Mobile)
+		logf(s.logger, "memory-first store: park for unknown or stale identity skipped")
 		return
 	}
 	if !applyParkRecord(&acct, rec, time.Now()) {
@@ -154,7 +154,7 @@ func (s *MemoryFirstStore) ApplyPark(rec upstream.ParkRecord) {
 	err := s.backing.SaveAccount(context.Background(), acct)
 	s.mu.Unlock()
 	if err != nil {
-		logf(s.logger, "memory-first store: cannot persist park state for %s: %v", rec.Mobile, err)
+		logf(s.logger, "memory-first store: cannot persist park state (store error)")
 	}
 }
 
@@ -175,7 +175,7 @@ func (s *MemoryFirstStore) ApplyLogin(rec upstream.LoginRecord) {
 	err := s.backing.SaveAccount(context.Background(), acct)
 	s.mu.Unlock()
 	if err != nil {
-		logf(s.logger, "memory-first store: cannot persist session token for %s: %v", rec.Identity, err)
+		logf(s.logger, "memory-first store: cannot persist session token (store error)")
 	}
 }
 

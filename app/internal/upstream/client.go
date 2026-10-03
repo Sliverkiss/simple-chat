@@ -1165,11 +1165,11 @@ func (am *AccountManager) fireStartupSequence(tok string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := am.client.UsersCurrent(ctx, tok); err != nil {
-			am.client.logf("startup users/current failed (ignored): %v", err)
+			am.client.logf("startup users/current failed (ignored)")
 			return
 		}
 		if err := am.client.FetchSessionPage(ctx, tok); err != nil {
-			am.client.logf("startup fetch_page failed (ignored): %v", err)
+			am.client.logf("startup fetch_page failed (ignored)")
 		}
 	}()
 }

@@ -194,12 +194,12 @@ func (s *cleanupScheduler) episode(ctx context.Context, acct upstream.AccountRef
 	tok, err := acct.AM.Token(ctx)
 	if err != nil {
 		// Raced into a park between listing and now — skip this account.
-		s.logger.Printf("cleanup: skipping %s (unavailable: %v)", acct.Mobile, err)
+		s.logger.Printf("cleanup: skipping unavailable account (%s)", consoleErrorClass(err))
 		return
 	}
 	sessions, err := acct.Client.ListSessions(ctx, tok)
 	if err != nil {
-		s.logger.Printf("cleanup: %s session list failed (skipped): %v", acct.Mobile, err)
+		s.logger.Printf("cleanup: session list failed (skipped, %s)", consoleErrorClass(err))
 		return
 	}
 	// Humans don't tidy pinned chats.
@@ -256,7 +256,7 @@ func (s *cleanupScheduler) episode(ctx context.Context, acct upstream.AccountRef
 		s.pendingMu.Unlock()
 		s.deleter.enqueue(deleteJob{client: acct.Client, token: tok, sessionID: sess.ID})
 	}
-	s.logger.Printf("cleanup episode: %s deleted %d, remaining %d", acct.Mobile, n, len(unpinned)-n)
+	s.logger.Printf("cleanup episode: deleted %d, remaining %d", n, len(unpinned)-n)
 }
 
 // nextInterval draws the next wake delay uniformly from

@@ -44,7 +44,7 @@ func (s *JSONStore) Load(ctx context.Context) ([]upstream.Account, error) {
 		if werr := os.WriteFile(s.path, []byte("{\"accounts\": []}"), 0600); werr != nil {
 			return nil, fmt.Errorf("create %s: %w", s.path, werr)
 		}
-		s.logf("accounts file %s missing — created empty store (add accounts via admin API)", s.path)
+		s.logf("accounts file missing — created empty store (add accounts via admin API)")
 		return nil, nil
 	}
 	info, err := os.Stat(s.path)
@@ -66,7 +66,7 @@ func (s *JSONStore) Load(ctx context.Context) ([]upstream.Account, error) {
 		// Empty store (fresh file or all accounts removed): valid state.
 		// The server starts with a zero-account pool; requests return
 		// no_accounts until accounts are added via the admin API.
-		s.logf("accounts file %s is empty (add accounts via admin API)", s.path)
+		s.logf("accounts file is empty (add accounts via admin API)")
 		return nil, nil
 	}
 	for _, a := range af.Accounts {
@@ -97,7 +97,7 @@ func (s *JSONStore) clearExpiredParks(accounts []upstream.Account) {
 		return
 	}
 	if err := s.writeFile(accounts); err != nil {
-		s.logf("accounts store: cannot clear expired parks in %s: %v", s.path, err)
+		s.logf("accounts store: cannot clear expired parks (store error)")
 	}
 }
 
@@ -163,9 +163,9 @@ func (s *JSONStore) ApplyPark(rec upstream.ParkRecord) {
 	if err != nil {
 		var pe *parseError
 		if errors.As(err, &pe) {
-			s.logf("accounts store: cannot parse %s to persist park state: %v", s.path, err)
+			s.logf("accounts store: cannot parse account file to persist park state")
 		} else {
-			s.logf("accounts store: cannot read %s to persist park state: %v", s.path, err)
+			s.logf("accounts store: cannot read account file to persist park state (store error)")
 		}
 		return
 	}
@@ -180,7 +180,7 @@ func (s *JSONStore) ApplyPark(rec upstream.ParkRecord) {
 		return
 	}
 	if err := s.writeFile(accounts); err != nil {
-		s.logf("accounts store: cannot write %s: %v", s.path, err)
+		s.logf("accounts store: cannot write account file (store error)")
 	}
 }
 

@@ -324,7 +324,7 @@ func (s *purgeScheduler) purgeAccount(ctx context.Context, acct upstream.Account
 	tok, err := acct.AM.Token(ctx)
 	if err != nil {
 		// Raced into a park between listing and now — skip this account.
-		s.logger.Printf("purge: skipping %s (unavailable: %v)", acct.Mobile, err)
+		s.logger.Printf("purge: skipping unavailable account (%s)", consoleErrorClass(err))
 		return
 	}
 	// Before-count from upstream truth (best-effort; a failed list
@@ -334,7 +334,7 @@ func (s *purgeScheduler) purgeAccount(ctx context.Context, acct upstream.Account
 		before = len(sessions)
 	}
 	if err := acct.Client.DeleteAllSessions(ctx, tok); err != nil {
-		s.logger.Printf("purge: %s delete_all failed (will retry next week): %v", acct.Mobile, err)
+		s.logger.Printf("purge: delete_all failed (will retry next week, %s)", consoleErrorClass(err))
 		return
 	}
 	after := -1
@@ -346,7 +346,7 @@ func (s *purgeScheduler) purgeAccount(ctx context.Context, acct upstream.Account
 	if s.sessions != nil {
 		s.sessions.reset(acct.Mobile)
 	}
-	s.logger.Printf("purge: %s cleared (%d → %d sessions)", acct.Mobile, before, after)
+	s.logger.Printf("purge: cleared (%d → %d sessions)", before, after)
 }
 
 // shutdown stops the loop goroutine. A purge interrupted mid-walk

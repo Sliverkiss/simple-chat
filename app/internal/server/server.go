@@ -344,7 +344,7 @@ func (s *Server) runWebSearchAttempt(ctx context.Context, w http.ResponseWriter,
 	})
 	if err != nil {
 		lease.NoteError(err)
-		s.logger.Printf("web search completion failed (attempt %d): %v", attempt, err)
+		s.logger.Printf("web search completion failed (attempt %d, %s)", attempt, consoleErrorClass(err))
 		if attempt < maxAttempts && ctx.Err() == nil && upstream.IsRetryable(err) {
 			return true
 		}
@@ -360,7 +360,7 @@ func (s *Server) runWebSearchAttempt(ctx context.Context, w http.ResponseWriter,
 		n, err := stream.Read(buf)
 		if n > 0 {
 			if ferr := interp.Feed(string(buf[:n])); ferr != nil {
-				s.logger.Printf("sse feed: %v", ferr)
+				s.logger.Printf("sse feed: %s", consoleErrorClass(ferr))
 				break
 			}
 		}
@@ -377,14 +377,14 @@ func (s *Server) runWebSearchAttempt(ctx context.Context, w http.ResponseWriter,
 	switch {
 	case st.Err != nil:
 		lease.NoteError(st.Err)
-		s.logger.Printf("web search failed (attempt %d): %v", attempt, st.Err)
+		s.logger.Printf("web search failed (attempt %d, %s)", attempt, consoleErrorClass(st.Err))
 		if attempt < maxAttempts && ctx.Err() == nil && isClientRetryableStreamError(st.Err) {
 			return true
 		}
 		s.writeUpstreamError(w, st.Err)
 		return false
 	case readErr != nil:
-		s.logger.Printf("web search transport error (attempt %d): %v", attempt, readErr)
+		s.logger.Printf("web search transport error (attempt %d, %s)", attempt, consoleErrorClass(readErr))
 		if attempt < maxAttempts && ctx.Err() == nil && upstream.IsRetryable(readErr) {
 			return true
 		}
@@ -530,7 +530,7 @@ func (s *Server) runAttempt(ctx context.Context, w http.ResponseWriter, req *ope
 	for _, img := range images {
 		fileID, err := lease.Client().UploadImageAndWait(ctx, tok, img.Data, "image."+img.Ext)
 		if err != nil {
-			s.logger.Printf("image upload failed: %v", err)
+			s.logger.Printf("image upload failed: %s", consoleErrorClass(err))
 			lease.NoteError(err)
 			writeError(w, http.StatusBadGateway, "image upload failed", "upstream_error", "upload_failed")
 			termination = "upload_error"
@@ -555,7 +555,7 @@ func (s *Server) runAttempt(ctx context.Context, w http.ResponseWriter, req *ope
 	})
 	if err != nil {
 		lease.NoteError(err)
-		s.logger.Printf("completion call failed (attempt %d): %v", attempt, err)
+		s.logger.Printf("completion call failed (attempt %d, %s)", attempt, consoleErrorClass(err))
 		termination = "completion_error"
 		if attempt < maxAttempts && ctx.Err() == nil && upstream.IsRetryable(err) {
 			previous.err = err
@@ -697,7 +697,7 @@ func (s *Server) deliverStream(ctx context.Context, w http.ResponseWriter, lease
 		n, err := stream.Read(buf)
 		if n > 0 {
 			if ferr := interp.Feed(string(buf[:n])); ferr != nil {
-				s.logger.Printf("sse feed: %v", ferr)
+				s.logger.Printf("sse feed: %s", consoleErrorClass(ferr))
 				break
 			}
 		}
@@ -713,7 +713,7 @@ func (s *Server) deliverStream(ctx context.Context, w http.ResponseWriter, lease
 					*termination = "stream_error"
 				}
 				lease.NoteError(st.Err)
-				s.logger.Printf("stream failed before first client byte (attempt %d): %v", attempt, st.Err)
+				s.logger.Printf("stream failed before first client byte (attempt %d, %s)", attempt, consoleErrorClass(st.Err))
 				if attempt < maxAttempts && ctx.Err() == nil && isClientRetryableStreamError(st.Err) {
 					previous.err = st.Err
 					previous.allowSameAccount = false
@@ -760,7 +760,7 @@ func (s *Server) deliverStream(ctx context.Context, w http.ResponseWriter, lease
 	case readErr != nil:
 		*termination = "transport_error"
 		// either — say so instead of lying with finish_reason:"stop".
-		s.logger.Printf("stream transport error: %v", readErr)
+		s.logger.Printf("stream transport error: %s", consoleErrorClass(readErr))
 		if !committed {
 			if attempt < maxAttempts && ctx.Err() == nil && upstream.IsRetryable(readErr) {
 				previous.err = readErr
@@ -813,7 +813,7 @@ func (s *Server) deliverNonStream(ctx context.Context, w http.ResponseWriter, le
 		n, err := stream.Read(buf)
 		if n > 0 {
 			if ferr := interp.Feed(string(buf[:n])); ferr != nil {
-				s.logger.Printf("sse feed: %v", ferr)
+				s.logger.Printf("sse feed: %s", consoleErrorClass(ferr))
 				break
 			}
 		}
@@ -836,7 +836,7 @@ func (s *Server) deliverNonStream(ctx context.Context, w http.ResponseWriter, le
 			*termination = "stream_error"
 		}
 		lease.NoteError(st.Err)
-		s.logger.Printf("non-stream failed (attempt %d): %v", attempt, st.Err)
+		s.logger.Printf("non-stream failed (attempt %d, %s)", attempt, consoleErrorClass(st.Err))
 		if attempt < maxAttempts && ctx.Err() == nil && isClientRetryableStreamError(st.Err) {
 			previous.err = st.Err
 			previous.allowSameAccount = false
@@ -849,7 +849,7 @@ func (s *Server) deliverNonStream(ctx context.Context, w http.ResponseWriter, le
 		*termination = "transport_error"
 		// Transport cut mid-stream: partial output would look like a
 		// successful (truncated) completion — retry instead.
-		s.logger.Printf("non-stream transport error (attempt %d): %v", attempt, readErr)
+		s.logger.Printf("non-stream transport error (attempt %d, %s)", attempt, consoleErrorClass(readErr))
 		if attempt < maxAttempts && ctx.Err() == nil && upstream.IsRetryable(readErr) {
 			previous.err = readErr
 			previous.allowSameAccount = true
@@ -896,14 +896,14 @@ func (s *Server) writePoolError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusServiceUnavailable, "no accounts available (all banned)", "upstream_error", "no_accounts")
 		return
 	}
-	writeError(w, http.StatusBadGateway, err.Error(), "upstream_error", "pool_failure")
+	writeError(w, http.StatusBadGateway, "account pool unavailable", "upstream_error", "pool_failure")
 }
 
 // writeUpstreamError maps upstream failures to OpenAI error shapes.
 // Client-facing text is stable and minimal (gap-analysis §4.6): raw err.Error()
 // can leak upstream biz_msg internals and pool detail. Details live in logs.
 func (s *Server) writeUpstreamError(w http.ResponseWriter, err error) {
-	s.logger.Printf("upstream error: %v", err)
+	s.logger.Printf("upstream error: %s", consoleErrorClass(err))
 	status := http.StatusBadGateway
 	typ := "upstream_error"
 	code := "upstream_failure"

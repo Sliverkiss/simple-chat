@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -10,8 +11,38 @@ import (
 	"testing"
 
 	"simple-chat/internal/openai"
+	"simple-chat/internal/sse"
 	"simple-chat/internal/upstream"
 )
+
+func TestConsoleErrorClassExcludesUpstreamPayload(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{
+		{&upstream.BizError{BizCode: 7, BizMsg: "private upstream payload"}, "biz_code=7"},
+		{&upstream.HTTPStatusError{Status: 503, Snippet: "private upstream payload"}, "http_status=503"},
+		{&sse.StreamError{Content: "private upstream payload"}, "stream_error"},
+		{errors.New("private upstream payload"), "transport"},
+	} {
+		if got := consoleErrorClass(tc.err); got != tc.want {
+			t.Errorf("class=%q, want %q", got, tc.want)
+		}
+	}
+}
+
+func TestUpstreamErrorConsoleOutputOmitsResponseBody(t *testing.T) {
+	var logs bytes.Buffer
+	s := &Server{logger: log.New(&logs, "", 0)}
+	w := httptest.NewRecorder()
+	s.writeUpstreamError(w, &upstream.HTTPStatusError{Status: 503, Snippet: "private upstream payload"})
+	if w.Code != http.StatusBadGateway || !strings.Contains(logs.String(), "http_status=503") {
+		t.Fatalf("status=%d; missing bounded diagnostic: %q", w.Code, logs.String())
+	}
+	if strings.Contains(logs.String(), "private upstream payload") || strings.Contains(w.Body.String(), "private upstream payload") {
+		t.Fatal("upstream response leaked to console or client")
+	}
+}
 
 func TestChatCompletionDiagnosticsAreStructuredAndRedacted(t *testing.T) {
 	up := newUpstreamFixture(t)

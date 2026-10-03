@@ -144,7 +144,7 @@ func (s *Server) handleAdminUpload(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// The store is the source of truth for the duplicate check; an
 		// unreadable store must not degrade into a blind write.
-		s.logger.Printf("admin upload: store load failed: %v", err)
+		s.logger.Printf("admin upload: store load failed (%s)", consoleErrorClass(err))
 		writeAdminError(w, http.StatusInternalServerError, "account store unavailable")
 		return
 	}
@@ -176,7 +176,7 @@ func (s *Server) handleAdminUpload(w http.ResponseWriter, r *http.Request) {
 			a.DeviceID = upstream.ResolveDeviceID(a)
 		}
 		if err := s.store.SaveAccount(r.Context(), a); err != nil {
-			s.logger.Printf("admin upload: store save %s failed: %v", a.Identity(), err)
+			s.logger.Printf("admin upload: store save failed (%s)", consoleErrorClass(err))
 			for _, prev := range stored {
 				s.store.DeleteAccount(r.Context(), prev.Identity())
 			}
@@ -191,7 +191,7 @@ func (s *Server) handleAdminUpload(w http.ResponseWriter, r *http.Request) {
 			// Should be impossible (validated above), but never 500 the
 			// whole batch over an already-persisted account — log and
 			// continue; a restart reloads it from the store.
-			s.logger.Printf("admin upload: pool add %s failed (persisted; picked up on restart): %v", a.Identity(), err)
+			s.logger.Printf("admin upload: pool add failed (persisted; picked up on restart): %s", consoleErrorClass(err))
 		}
 	}
 	writeAdminJSON(w, http.StatusOK, map[string]any{"accounts": toAdminResponses(stored)})
@@ -302,9 +302,9 @@ func (s *Server) handleAdminDelete(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, accountstore.ErrAccountNotFound) {
 			// In the pool but not the store (memory-only ParkStore config):
 			// still retire it from rotation.
-			s.logger.Printf("admin delete: %s not in store (pool-only); retiring from pool", id)
+			s.logger.Printf("admin delete: not in store (pool-only); retiring from pool")
 		} else {
-			s.logger.Printf("admin delete: store delete %s failed: %v", id, err)
+			s.logger.Printf("admin delete: store delete failed (%s)", consoleErrorClass(err))
 			writeAdminError(w, http.StatusInternalServerError, "account store delete failed")
 			return
 		}

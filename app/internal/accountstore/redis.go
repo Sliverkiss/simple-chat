@@ -174,14 +174,14 @@ func (s *RedisStore) Load(ctx context.Context) ([]upstream.Account, error) {
 		}
 		var acct upstream.Account
 		if err := json.Unmarshal([]byte(raw.(string)), &acct); err != nil {
-			s.logf("redis store: skipping unparseable account key for %s: %v", mobile, err)
+			s.logf("redis store: skipping unparseable account key")
 			continue
 		}
 		if parkExpired(acct, time.Now()) {
 			acct.ParkKind, acct.ParkUntil = "", ""
 			acct.ParkReason, acct.ParkedAt = "", ""
 			if err := s.SaveAccount(ctx, acct); err != nil {
-				s.logf("redis store: cannot clear expired park for %s: %v", mobile, err)
+				s.logf("redis store: cannot clear expired park (store error)")
 			}
 		}
 		accounts = append(accounts, acct)
@@ -249,19 +249,19 @@ func (s *RedisStore) ApplyPark(rec upstream.ParkRecord) {
 	defer s.mu.Unlock()
 	raw, err := s.get(context.Background(), redisKeyPrefix+rec.Mobile)
 	if err != nil {
-		s.logf("redis store: cannot load %s to persist park state: %v", rec.Mobile, err)
+		s.logf("redis store: cannot load account to persist park state (store error)")
 		return
 	}
 	if raw == nil {
 		// Park for a mobile not in the store (e.g. an imported account
 		// removed mid-run): nothing to update — same no-op the JSON store
 		// takes for an unknown mobile.
-		s.logf("redis store: park for unknown mobile %s skipped", rec.Mobile)
+		s.logf("redis store: park for unknown account skipped")
 		return
 	}
 	var acct upstream.Account
 	if err := json.Unmarshal([]byte(raw.(string)), &acct); err != nil {
-		s.logf("redis store: cannot parse %s to persist park state: %v", rec.Mobile, err)
+		s.logf("redis store: cannot parse account to persist park state")
 		return
 	}
 	if !applyParkRecord(&acct, rec, time.Now()) {
@@ -269,11 +269,11 @@ func (s *RedisStore) ApplyPark(rec upstream.ParkRecord) {
 	}
 	out, err := json.Marshal(acct)
 	if err != nil {
-		s.logf("redis store: cannot marshal park state: %v", err)
+		s.logf("redis store: cannot marshal park state")
 		return
 	}
 	if _, err := s.conn.do("SET", redisKeyPrefix+rec.Mobile, string(out)); err != nil {
-		s.logf("redis store: cannot persist park state for %s: %v", rec.Mobile, err)
+		s.logf("redis store: cannot persist park state (store error)")
 	}
 }
 
