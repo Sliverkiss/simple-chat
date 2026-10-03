@@ -300,8 +300,9 @@ func (s *Server) handleWebSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	var previous chatRetry
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		if !s.runWebSearchAttempt(ctx, w, req.Query, attempt) {
+		if !s.runWebSearchAttempt(ctx, w, req.Query, attempt, &previous) {
 			return
 		}
 	}
@@ -310,13 +311,28 @@ func (s *Server) handleWebSearch(w http.ResponseWriter, r *http.Request) {
 // runWebSearchAttempt executes one lease→session→completion→collect cycle.
 // Returns true when the caller should re-attempt on a fresh account (retryable
 // failure with nothing written to the client).
-func (s *Server) runWebSearchAttempt(ctx context.Context, w http.ResponseWriter, query string, attempt int) bool {
-	lease, err := s.pool.Acquire(ctx)
+func (s *Server) runWebSearchAttempt(ctx context.Context, w http.ResponseWriter, query string, attempt int, previous *chatRetry) bool {
+	var lease *upstream.Lease
+	var err error
+	if attempt == 1 {
+		lease, _, err = s.pool.AcquireWithWait(ctx)
+	} else {
+		lease, _, err = s.pool.AcquireWithWaitExcluding(ctx, previous.identity)
+		if errors.Is(err, upstream.ErrNoAlternativeAccount) {
+			if previous.allowSameAccount && !noReadyAccounts(s.pool) {
+				lease, _, err = s.pool.AcquireWithWait(ctx)
+			} else {
+				s.writeUpstreamError(w, previous.err)
+				return false
+			}
+		}
+	}
 	if err != nil {
 		s.writePoolError(w, err)
 		return false
 	}
 	defer lease.Release()
+	previous.identity = lease.Account().Identity()
 
 	tok, err := lease.Token(ctx)
 	if err != nil {
@@ -346,6 +362,7 @@ func (s *Server) runWebSearchAttempt(ctx context.Context, w http.ResponseWriter,
 		lease.NoteError(err)
 		s.logger.Printf("web search completion failed (attempt %d, %s)", attempt, consoleErrorClass(err))
 		if attempt < maxAttempts && ctx.Err() == nil && upstream.IsRetryable(err) {
+			previous.err, previous.allowSameAccount = err, true
 			return true
 		}
 		s.writeUpstreamError(w, err)
@@ -379,6 +396,7 @@ func (s *Server) runWebSearchAttempt(ctx context.Context, w http.ResponseWriter,
 		lease.NoteError(st.Err)
 		s.logger.Printf("web search failed (attempt %d, %s)", attempt, consoleErrorClass(st.Err))
 		if attempt < maxAttempts && ctx.Err() == nil && isClientRetryableStreamError(st.Err) {
+			previous.err, previous.allowSameAccount = st.Err, false
 			return true
 		}
 		s.writeUpstreamError(w, st.Err)
@@ -386,6 +404,7 @@ func (s *Server) runWebSearchAttempt(ctx context.Context, w http.ResponseWriter,
 	case readErr != nil:
 		s.logger.Printf("web search transport error (attempt %d, %s)", attempt, consoleErrorClass(readErr))
 		if attempt < maxAttempts && ctx.Err() == nil && upstream.IsRetryable(readErr) {
+			previous.err, previous.allowSameAccount = readErr, true
 			return true
 		}
 		writeError(w, http.StatusBadGateway, "upstream stream terminated early", "upstream_error", "stream_error")
