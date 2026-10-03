@@ -125,7 +125,12 @@ func NewServer(cfg Config) (*Server, error) {
 	// implements ApplyLogin receives every fresh login token. Stores that
 	// don't (JSON file) keep memory-only tokens — zero behavior change.
 	var onLoginPersist func(upstream.LoginRecord)
+	var persistenceGeneration func(string) uint64
 	if cfg.ParkStore != nil {
+		if mem, ok := cfg.ParkStore.(*accountstore.MemoryFirstStore); ok {
+			mem.EnablePersistenceFencing()
+			persistenceGeneration = mem.PersistenceGeneration
+		}
 		if al, ok := cfg.ParkStore.(interface {
 			ApplyLogin(upstream.LoginRecord)
 		}); ok {
@@ -133,12 +138,13 @@ func NewServer(cfg Config) (*Server, error) {
 		}
 	}
 	pool, err := upstream.NewPool(cfg.Accounts, upstream.PoolConfig{
-		BaseURL:        cfg.UpstreamBase,
-		MaxInflight:    cfg.MaxInflight,
-		QueueWait:      cfg.QueueWait,
-		OnParkPersist:  onParkPersist,
-		OnLoginPersist: onLoginPersist,
-		RandomSeed:     cfg.RandomSeed,
+		BaseURL:               cfg.UpstreamBase,
+		MaxInflight:           cfg.MaxInflight,
+		QueueWait:             cfg.QueueWait,
+		OnParkPersist:         onParkPersist,
+		OnLoginPersist:        onLoginPersist,
+		PersistenceGeneration: persistenceGeneration,
+		RandomSeed:            cfg.RandomSeed,
 		Logger: func(format string, args ...any) {
 			logger.Printf(format, args...)
 		},

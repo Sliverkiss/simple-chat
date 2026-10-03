@@ -73,7 +73,8 @@ func TestPoolLoginCallbackAdmittedBeforeRemovalCannotPersistAfterReadd(t *testin
 	}))
 	defer srv.Close()
 	pool, err := upstream.NewPool([]upstream.Account{old}, upstream.PoolConfig{
-		BaseURL: srv.URL,
+		BaseURL:               srv.URL,
+		PersistenceGeneration: store.PersistenceGeneration,
 		OnLoginPersist: func(rec upstream.LoginRecord) {
 			close(entered)
 			<-release
@@ -135,5 +136,65 @@ func TestPoolLoginCallbackAdmittedBeforeRemovalCannotPersistAfterReadd(t *testin
 		if len(rows) != 1 || rows[0].Password != fresh.Password || rows[0].SessionToken != fresh.SessionToken {
 			t.Errorf("%s contains stale login after identity re-add: %+v; want new password and token", label, rows)
 		}
+	}
+}
+
+func TestPoolParkCallbackGenerationCannotOverwriteReaddedAccount(t *testing.T) {
+	const id = "13800000000"
+	ctx := context.Background()
+	old := upstream.Account{Mobile: id, Password: "old-password"}
+	backing := &admissionBacking{rows: map[string]upstream.Account{id: old}}
+	store, err := accountstore.NewMemoryFirstStore(ctx, backing, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var records []upstream.ParkRecord
+	pool, err := upstream.NewPool([]upstream.Account{old}, upstream.PoolConfig{
+		PersistenceGeneration: store.PersistenceGeneration,
+		OnParkPersist:         func(rec upstream.ParkRecord) { records = append(records, rec) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease.NoteError(&upstream.BizError{BizCode: 5, BizMsg: "user is muted"})
+	lease.Release()
+	if len(records) != 1 {
+		t.Fatalf("park callbacks = %d, want 1", len(records))
+	}
+	if !pool.RemoveAccount(id) {
+		t.Fatal("remove old generation")
+	}
+	if err := store.DeleteAccount(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	fresh := upstream.Account{Mobile: id, Password: "new-password", SessionToken: "new-token"}
+	if err := store.SaveAccount(ctx, fresh); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.AddAccount(fresh); err != nil {
+		t.Fatal(err)
+	}
+	store.ApplyPark(records[0])
+	store.ApplyPark(upstream.ParkRecord{Mobile: id, Kind: upstream.BanNone, Generation: records[0].Generation})
+	store.ApplyPark(upstream.ParkRecord{Mobile: id, Kind: upstream.BanBanned}) // legacy zero-generation
+	store.ApplyLogin(upstream.LoginRecord{Identity: id, Token: "stale-token"})
+	for label, source := range map[string]func(context.Context) ([]upstream.Account, error){"cache": store.Load, "backing": backing.Load} {
+		rows, err := source(ctx)
+		if err != nil || len(rows) != 1 || rows[0] != fresh {
+			t.Errorf("%s: rows=%+v err=%v; want fresh record", label, rows, err)
+		}
+	}
+	current := store.PersistenceGeneration(id)
+	if current == records[0].Generation || current == 0 {
+		t.Fatalf("new generation %d must differ from old %d", current, records[0].Generation)
+	}
+	store.ApplyLogin(upstream.LoginRecord{Identity: id, Token: "current-token", Generation: current})
+	rows, err := backing.Load(ctx)
+	if err != nil || len(rows) != 1 || rows[0].SessionToken != "current-token" {
+		t.Fatalf("current generation login not persisted: rows=%+v err=%v", rows, err)
 	}
 }

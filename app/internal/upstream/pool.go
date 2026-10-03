@@ -69,7 +69,10 @@ type PoolConfig struct {
 	// persisted SessionToken field. Same posture as the park sink —
 	// synchronous, fail-soft, nil = memory-only tokens.
 	OnLoginPersist func(LoginRecord)
-	Logger         func(format string, args ...any)
+	// PersistenceGeneration snapshots the store's identity generation when a
+	// runtime account is built. Nil keeps legacy, unfenced callback records.
+	PersistenceGeneration func(identity string) uint64
+	Logger                func(format string, args ...any)
 	// RandomSeed makes selection reproducible in tests. Zero seeds from the
 	// current clock; all access to the PRNG is serialized by p.mu.
 	RandomSeed int64
@@ -79,14 +82,16 @@ type PoolConfig struct {
 
 // LoginRecord is one successful login, handed to PoolConfig.OnLoginPersist.
 type LoginRecord struct {
-	Identity string
-	Token    string
+	Identity   string
+	Token      string
+	Generation uint64
 }
 
 // ParkRecord is one park-state transition, handed to PoolConfig.OnParkPersist.
 // A zero Until with Kind=BanBanned means "forever" (manual revive only).
 type ParkRecord struct {
-	Mobile string
+	Mobile     string
+	Generation uint64
 	// Kind is the new state: BanBanned/BanMuted/BanRiskDevice on a park,
 	// BanNone on a natural unpark (fields below are zero then).
 	Kind   BanState
@@ -152,7 +157,8 @@ type poolAccount struct {
 	am      *AccountManager
 	// active is shared by duplicate rows and invalidated when this generation
 	// leaves the ring. Login callbacks run under am.mu, not p.mu.
-	active *atomic.Bool
+	active     *atomic.Bool
+	generation uint64
 
 	// Duplicate rows for one physical identity share this semaphore, client,
 	// and manager. Rows remain separate for admin display and ring weighting.
@@ -255,6 +261,10 @@ func (p *Pool) buildAccount(a Account) (*poolAccount, error) {
 	client.SetLogger(p.cfg.Logger)
 	active := &atomic.Bool{}
 	active.Store(true)
+	var generation uint64
+	if p.cfg.PersistenceGeneration != nil {
+		generation = p.cfg.PersistenceGeneration(a.Identity())
+	}
 	// Login write-through (docs-spec-memory-first.md): every successful
 	// login/relogin hands the fresh token to the sink under the manager's
 	// lock. Nil hook = memory-only tokens (current behavior).
@@ -262,16 +272,17 @@ func (p *Pool) buildAccount(a Account) (*poolAccount, error) {
 		hook := p.cfg.OnLoginPersist
 		client.AccountManager().onLogin = func(tok string) {
 			if active.Load() {
-				hook(LoginRecord{Identity: a.Identity(), Token: tok})
+				hook(LoginRecord{Identity: a.Identity(), Token: tok, Generation: generation})
 			}
 		}
 	}
 	pa := &poolAccount{
-		account: a,
-		client:  client,
-		am:      client.AccountManager(),
-		active:  active,
-		slots:   make(chan struct{}, p.cfg.MaxInflight),
+		account:    a,
+		client:     client,
+		am:         client.AccountManager(),
+		active:     active,
+		generation: generation,
+		slots:      make(chan struct{}, p.cfg.MaxInflight),
 	}
 	// Restore persisted park state (TASK_MUTE): an account muted/banned
 	// before a restart must not re-enter rotation "clean" — re-hitting
@@ -330,7 +341,7 @@ func (p *Pool) joinIdentity(pa *poolAccount) error {
 			existing.am.ban, existing.am.parkUntil, existing.am.banMsg = kind, until, reason
 		}
 		existing.am.mu.Unlock()
-		pa.client, pa.am, pa.slots, pa.active = existing.client, existing.am, existing.slots, existing.active
+		pa.client, pa.am, pa.slots, pa.active, pa.generation = existing.client, existing.am, existing.slots, existing.active, existing.generation
 		return nil
 	}
 	return nil
@@ -700,6 +711,7 @@ func (p *Pool) notifyParkPersist(pa *poolAccount, rec ParkRecord) {
 	if p.cfg.OnParkPersist == nil {
 		return
 	}
+	rec.Generation = pa.generation
 	p.cfg.OnParkPersist(rec)
 }
 

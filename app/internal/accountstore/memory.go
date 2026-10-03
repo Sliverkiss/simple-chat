@@ -40,6 +40,12 @@ type MemoryFirstStore struct {
 	// callbacks enter here with the account lock already held.
 	mu       sync.Mutex
 	accounts map[string]upstream.Account // keyed by Identity()
+	// generations fence callbacks from removed/replaced runtime accounts.
+	// Keep tombstones so a later re-add cannot reuse a former generation.
+	generations map[string]uint64
+	// fenced is enabled by pool wiring; legacy direct callers may continue
+	// sending records without a generation when no pool uses this store.
+	fenced bool
 }
 
 // NewMemoryFirstStore performs the one boot load from the backing store and
@@ -59,7 +65,32 @@ func NewMemoryFirstStore(ctx context.Context, backing Store, logger *log.Logger)
 	if len(cache) == 0 {
 		logf(logger, "memory-first store: backing is empty — starting with an empty pool (add accounts via admin API)")
 	}
-	return &MemoryFirstStore{backing: backing, logger: logger, accounts: cache}, nil
+	generations := make(map[string]uint64, len(cache))
+	for id := range cache {
+		generations[id] = 1
+	}
+	return &MemoryFirstStore{backing: backing, logger: logger, accounts: cache, generations: generations}, nil
+}
+
+// PersistenceGeneration returns a stable snapshot for a pool account. A
+// callback carrying this value is checked atomically with its backing write.
+func (s *MemoryFirstStore) PersistenceGeneration(identity string) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.fenced = true
+	return s.generations[identity]
+}
+
+// EnablePersistenceFencing rejects generation-free callbacks even if the
+// pool starts empty and has not yet built an account.
+func (s *MemoryFirstStore) EnablePersistenceFencing() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.fenced = true
+}
+
+func (s *MemoryFirstStore) acceptsGeneration(identity string, generation uint64) bool {
+	return generation == s.generations[identity] || !s.fenced && generation == 0
 }
 
 // Load returns the cached accounts. Zero backing reads — this is the
@@ -84,6 +115,7 @@ func (s *MemoryFirstStore) SaveAccount(ctx context.Context, acct upstream.Accoun
 		return err
 	}
 	s.accounts[acct.Identity()] = acct
+	s.generations[acct.Identity()]++
 	return nil
 }
 
@@ -96,6 +128,7 @@ func (s *MemoryFirstStore) DeleteAccount(ctx context.Context, identity string) e
 		return err
 	}
 	delete(s.accounts, identity)
+	s.generations[identity]++
 	return nil
 }
 
@@ -108,9 +141,9 @@ func (s *MemoryFirstStore) DeleteAccount(ctx context.Context, identity string) e
 func (s *MemoryFirstStore) ApplyPark(rec upstream.ParkRecord) {
 	s.mu.Lock()
 	acct, ok := s.accounts[rec.Mobile]
-	if !ok {
+	if !ok || !s.acceptsGeneration(rec.Mobile, rec.Generation) {
 		s.mu.Unlock()
-		logf(s.logger, "memory-first store: park for unknown identity %s skipped", rec.Mobile)
+		logf(s.logger, "memory-first store: park for unknown or stale identity %s skipped", rec.Mobile)
 		return
 	}
 	if !applyParkRecord(&acct, rec, time.Now()) {
@@ -131,7 +164,7 @@ func (s *MemoryFirstStore) ApplyPark(rec upstream.ParkRecord) {
 func (s *MemoryFirstStore) ApplyLogin(rec upstream.LoginRecord) {
 	s.mu.Lock()
 	acct, ok := s.accounts[rec.Identity]
-	if !ok {
+	if !ok || !s.acceptsGeneration(rec.Identity, rec.Generation) {
 		s.mu.Unlock()
 		// Login for an identity not in the store (removed mid-run): nothing
 		// to update — the token lives in the pool's memory only.
