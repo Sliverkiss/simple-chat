@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -149,6 +150,9 @@ type poolAccount struct {
 	account Account
 	client  *Client
 	am      *AccountManager
+	// active is shared by duplicate rows and invalidated when this generation
+	// leaves the ring. Login callbacks run under am.mu, not p.mu.
+	active *atomic.Bool
 
 	// Duplicate rows for one physical identity share this semaphore, client,
 	// and manager. Rows remain separate for admin display and ring weighting.
@@ -175,8 +179,8 @@ type Pool struct {
 	cfg       PoolConfig
 	transport http.RoundTripper // shared tuned Transport (R5)
 
-	mu      sync.Mutex
-	rng     *rand.Rand
+	mu  sync.Mutex
+	rng *rand.Rand
 	// nextSeq counts successful acquisitions for introspection.
 	nextSeq int
 }
@@ -207,7 +211,9 @@ func NewPool(accounts []Account, cfg PoolConfig) (*Pool, error) {
 		if err != nil {
 			return nil, err
 		}
-		p.joinIdentity(pa)
+		if err := p.joinIdentity(pa); err != nil {
+			return nil, err
+		}
 		if pa.am.ban != BanNone {
 			parked++
 		}
@@ -247,19 +253,24 @@ func (p *Pool) buildAccount(a Account) (*poolAccount, error) {
 	})
 	client.SetTransport(p.transport)
 	client.SetLogger(p.cfg.Logger)
+	active := &atomic.Bool{}
+	active.Store(true)
 	// Login write-through (docs-spec-memory-first.md): every successful
 	// login/relogin hands the fresh token to the sink under the manager's
 	// lock. Nil hook = memory-only tokens (current behavior).
 	if p.cfg.OnLoginPersist != nil {
 		hook := p.cfg.OnLoginPersist
 		client.AccountManager().onLogin = func(tok string) {
-			hook(LoginRecord{Identity: a.Identity(), Token: tok})
+			if active.Load() {
+				hook(LoginRecord{Identity: a.Identity(), Token: tok})
+			}
 		}
 	}
 	pa := &poolAccount{
 		account: a,
 		client:  client,
 		am:      client.AccountManager(),
+		active:  active,
 		slots:   make(chan struct{}, p.cfg.MaxInflight),
 	}
 	// Restore persisted park state (TASK_MUTE): an account muted/banned
@@ -290,10 +301,20 @@ func (p *Pool) buildAccount(a Account) (*poolAccount, error) {
 // under p.mu (or during construction before the pool is published). A parked
 // duplicate from persistence must not resurrect a ready copy; keep the most
 // restrictive restored state, and the later window for equal timed parks.
-func (p *Pool) joinIdentity(pa *poolAccount) {
+func (p *Pool) joinIdentity(pa *poolAccount) error {
 	for _, existing := range p.accounts {
 		if existing.account.Identity() != pa.account.Identity() {
 			continue
+		}
+		// A shared client must never silently select one row's login or
+		// wire fingerprint. Do not include credential/device values in errors.
+		if existing.account.Mobile != pa.account.Mobile ||
+			existing.account.Email != pa.account.Email ||
+			existing.account.Password != pa.account.Password ||
+			existing.account.normalizedRegion() != pa.account.normalizedRegion() ||
+			ResolveDeviceID(existing.account) != ResolveDeviceID(pa.account) ||
+			existing.account.Channel != pa.account.Channel {
+			return fmt.Errorf("upstream: conflicting account configuration for identity %s", pa.account.Identity())
 		}
 		pa.am.mu.Lock()
 		kind, until, reason := pa.am.ban, pa.am.parkUntil, pa.am.banMsg
@@ -305,9 +326,10 @@ func (p *Pool) joinIdentity(pa *poolAccount) {
 			existing.am.ban, existing.am.parkUntil, existing.am.banMsg = kind, until, reason
 		}
 		existing.am.mu.Unlock()
-		pa.client, pa.am, pa.slots = existing.client, existing.am, existing.slots
-		return
+		pa.client, pa.am, pa.slots, pa.active = existing.client, existing.am, existing.slots, existing.active
+		return nil
 	}
+	return nil
 }
 
 // AddAccount hot-adds one validated account to the ring (admin API): no
@@ -324,7 +346,9 @@ func (p *Pool) AddAccount(a Account) error {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.joinIdentity(pa)
+	if err := p.joinIdentity(pa); err != nil {
+		return err
+	}
 	p.accounts = append(p.accounts, pa)
 	// Grow the shared transport's idle pool so the new account's
 	// concurrency does not force TCP+TLS re-handshakes.
@@ -353,6 +377,7 @@ func (p *Pool) RemoveAccount(id string) bool {
 	removed := 0
 	for _, pa := range p.accounts {
 		if pa.account.MatchesIdentity(id) {
+			pa.active.Store(false)
 			removed++
 			continue
 		}
@@ -617,9 +642,15 @@ func (l *Lease) NoteError(err error) {
 	defer l.pool.mu.Unlock()
 	l.pa.am.mu.Lock()
 	defer l.pa.am.mu.Unlock()
+	// A permanent ban wins over delayed mute/risk responses from leases
+	// acquired before the ban; never replace the durable park record.
+	if l.pa.am.ban == BanBanned {
+		return
+	}
 	switch BanKind(err) {
 	case BanBanned:
 		l.pa.am.ban = BanBanned
+		l.pa.am.parkUntil = time.Time{}
 		l.pa.am.banMsg = "account banned: " + err.Error()
 	case BanMuted:
 		until := time.Time{}
