@@ -279,28 +279,29 @@ func (p *Pool) buildAccount(a Account) (*poolAccount, error) {
 	// escalation). Expired parks are ignored (ready on load); banned
 	// persists forever.
 	kind, until := parsePersistedPark(a)
-	if kind != BanNone && !until.IsZero() && !time.Now().After(until) {
+	if kind == BanBanned {
+		// A ban is permanent even if a stale persisted row has an until.
+		pa.am.mu.Lock()
+		pa.am.ban = BanBanned
+		pa.am.banMsg = a.ParkReason
+		pa.am.mu.Unlock()
+		p.logf("pool: %s still BANNED (restored from disk; manual revive = delete park fields from accounts.json)", a.Identity())
+	} else if kind != BanNone && !until.IsZero() && !time.Now().After(until) {
 		pa.am.mu.Lock()
 		pa.am.ban = kind
 		pa.am.parkUntil = until
 		pa.am.banMsg = a.ParkReason
 		pa.am.mu.Unlock()
 		p.logf("pool: %s still %s until %s (restored from disk)", a.Identity(), banName(kind), until.Format(time.RFC3339))
-	} else if kind == BanBanned {
-		// Banned has no window: zero/absent until means forever.
-		pa.am.mu.Lock()
-		pa.am.ban = BanBanned
-		pa.am.banMsg = a.ParkReason
-		pa.am.mu.Unlock()
-		p.logf("pool: %s still BANNED (restored from disk; manual revive = delete park fields from accounts.json)", a.Identity())
 	}
 	return pa, nil
 }
 
 // joinIdentity shares one runtime state per physical identity. Called only
 // under p.mu (or during construction before the pool is published). A parked
-// duplicate from persistence must not resurrect a ready copy; keep the most
-// restrictive restored state, and the later window for equal timed parks.
+// duplicate from persistence must not resurrect a ready copy: a permanent ban
+// wins, otherwise keep the later timed window (regardless of park kind).
+// Equal deadlines prefer mute over risk, then lexicographically later reason.
 func (p *Pool) joinIdentity(pa *poolAccount) error {
 	for _, existing := range p.accounts {
 		if existing.account.Identity() != pa.account.Identity() {
@@ -320,9 +321,12 @@ func (p *Pool) joinIdentity(pa *poolAccount) error {
 		kind, until, reason := pa.am.ban, pa.am.parkUntil, pa.am.banMsg
 		pa.am.mu.Unlock()
 		existing.am.mu.Lock()
-		if kind == BanBanned && existing.am.ban != BanBanned ||
+		if kind == BanBanned && (existing.am.ban != BanBanned || reason > existing.am.banMsg) ||
 			kind != BanNone && existing.am.ban == BanNone ||
-			kind != BanNone && kind == existing.am.ban && until.After(existing.am.parkUntil) {
+			kind != BanNone && kind != BanBanned && existing.am.ban != BanBanned &&
+				(until.After(existing.am.parkUntil) ||
+					until.Equal(existing.am.parkUntil) && (kind == BanMuted && existing.am.ban == BanRiskDevice ||
+						kind == existing.am.ban && reason > existing.am.banMsg)) {
 			existing.am.ban, existing.am.parkUntil, existing.am.banMsg = kind, until, reason
 		}
 		existing.am.mu.Unlock()
