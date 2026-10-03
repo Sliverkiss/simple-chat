@@ -88,6 +88,35 @@ func TestPoolBoundaryNonStreamEOFWithoutSemanticFinishFails(t *testing.T) {
 	}
 }
 
+func TestPoolBoundaryEventCloseWithoutStatusIsClean(t *testing.T) {
+	up := poolBoundaryUpstream(t, "event: close\ndata: {}\n")
+	defer up.Close()
+	var logs bytes.Buffer
+	gw := poolBoundaryGateway(t, up.URL, &logs)
+	for _, stream := range []bool{true, false} {
+		status, body := poolBoundaryChat(t, gw, stream)
+		if status != http.StatusOK || !strings.Contains(body, `"content":"partial"`) || !strings.Contains(body, `"finish_reason":"stop"`) {
+			t.Errorf("close without status is a clean terminal event (stream=%v): status=%d body=%s", stream, status, body)
+		}
+	}
+}
+
+func TestPoolBoundaryEOFBeforeFirstByteFailsWithoutSuccess(t *testing.T) {
+	up := httptest.NewServer(ladderMux(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: ready\ndata: {}\n")
+	}))
+	defer up.Close()
+	var logs bytes.Buffer
+	gw := poolBoundaryGateway(t, up.URL, &logs)
+	for _, stream := range []bool{true, false} {
+		status, body := poolBoundaryChat(t, gw, stream)
+		if status != http.StatusBadGateway || !strings.Contains(body, `"code":"stream_error"`) {
+			t.Errorf("uncommitted EOF cannot be success (stream=%v): status=%d body=%s", stream, status, body)
+		}
+	}
+}
+
 func TestPoolBoundaryContentFilterAfterDeltaDiagnostic(t *testing.T) {
 	up := poolBoundaryUpstream(t, "data: {\"error\":{\"code\":\"content_filter\"}}\n\n")
 	defer up.Close()

@@ -360,9 +360,7 @@ func (s *Server) runWebSearchAttempt(ctx context.Context, w http.ResponseWriter,
 			break
 		}
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				readErr = err
-			}
+			readErr = unfinishedStreamError(err)
 			break
 		}
 	}
@@ -395,6 +393,15 @@ func (s *Server) runWebSearchAttempt(ctx context.Context, w http.ResponseWriter,
 // original attempt plus one switch-account retry. More than that multiplies
 // load against an upstream that is already struggling.
 const maxAttempts = 2
+
+// Transport EOF alone is not evidence that the upstream completed its answer.
+// Only call after checking the interpreter's terminal state.
+func unfinishedStreamError(err error) error {
+	if errors.Is(err, io.EOF) {
+		return io.ErrUnexpectedEOF
+	}
+	return err
+}
 
 // handleChatCompletions runs the full pipeline: parse → images (off-lease) →
 // per-attempt {acquire → upload → session → completion → deliver}, retrying
@@ -703,9 +710,7 @@ func (s *Server) deliverStream(ctx context.Context, w http.ResponseWriter, lease
 			break
 		}
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				readErr = err
-			}
+			readErr = unfinishedStreamError(err)
 			break
 		}
 	}
@@ -713,7 +718,11 @@ func (s *Server) deliverStream(ctx context.Context, w http.ResponseWriter, lease
 	*usage = st.Usage
 	switch {
 	case st.Err != nil:
-		*termination = "stream_error"
+		if errors.Is(st.Err, sse.ErrContentFilter) {
+			*termination = "content_filter"
+		} else {
+			*termination = "stream_error"
+		}
 		// completion finished normally — silently truncated output that looks
 		// right (gap-analysis R2). The error frame already went out; the only
 		// acceptable extra is a final chunk carrying the upstream's own
@@ -787,9 +796,7 @@ func (s *Server) deliverNonStream(ctx context.Context, w http.ResponseWriter, le
 			break
 		}
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				readErr = err
-			}
+			readErr = unfinishedStreamError(err)
 			break
 		}
 	}
@@ -797,7 +804,11 @@ func (s *Server) deliverNonStream(ctx context.Context, w http.ResponseWriter, le
 	*usage = st.Usage
 	switch {
 	case st.Err != nil:
-		*termination = "stream_error"
+		if errors.Is(st.Err, sse.ErrContentFilter) {
+			*termination = "content_filter"
+		} else {
+			*termination = "stream_error"
+		}
 		lease.NoteError(st.Err)
 		s.logger.Printf("non-stream failed (attempt %d): %v", attempt, st.Err)
 		if attempt < maxAttempts && ctx.Err() == nil && isClientRetryableStreamError(st.Err) {
