@@ -152,7 +152,8 @@ type poolAccount struct {
 	client  *Client
 	am      *AccountManager
 
-	// slots is the in-flight semaphore: buffered channel of size MaxInflight.
+	// Duplicate rows for one physical identity share this semaphore, client,
+	// and manager. Rows remain separate for admin display and ring weighting.
 	slots chan struct{}
 	// ewmaNanos is updated under Pool.mu after a completed request. Zero means
 	// no latency sample yet.
@@ -207,6 +208,7 @@ func NewPool(accounts []Account, cfg PoolConfig) (*Pool, error) {
 		if err != nil {
 			return nil, err
 		}
+		p.joinIdentity(pa)
 		if pa.am.ban != BanNone {
 			parked++
 		}
@@ -228,9 +230,8 @@ func (p *Pool) buildAccount(a Account) (*poolAccount, error) {
 	if err := a.Validate(); err != nil {
 		return nil, fmt.Errorf("upstream: account %s: %w", a.Identity(), err)
 	}
-	// Duplicate entries are intentional: each accounts.json row is its
-	// own ring slot (own token, own semaphore), giving one physical
-	// account more slots when repeated.
+	// The caller joins duplicate rows to the existing physical identity
+	// before making this slot visible to acquisition.
 	client := NewClient(Config{
 		BaseURL:  p.cfg.BaseURL,
 		Mobile:   a.Mobile,
@@ -286,6 +287,30 @@ func (p *Pool) buildAccount(a Account) (*poolAccount, error) {
 	return pa, nil
 }
 
+// joinIdentity shares one runtime state per physical identity. Called only
+// under p.mu (or during construction before the pool is published). A parked
+// duplicate from persistence must not resurrect a ready copy; keep the most
+// restrictive restored state, and the later window for equal timed parks.
+func (p *Pool) joinIdentity(pa *poolAccount) {
+	for _, existing := range p.accounts {
+		if existing.account.Identity() != pa.account.Identity() {
+			continue
+		}
+		pa.am.mu.Lock()
+		kind, until, reason := pa.am.ban, pa.am.parkUntil, pa.am.banMsg
+		pa.am.mu.Unlock()
+		existing.am.mu.Lock()
+		if kind == BanBanned && existing.am.ban != BanBanned ||
+			kind != BanNone && existing.am.ban == BanNone ||
+			kind != BanNone && kind == existing.am.ban && until.After(existing.am.parkUntil) {
+			existing.am.ban, existing.am.parkUntil, existing.am.banMsg = kind, until, reason
+		}
+		existing.am.mu.Unlock()
+		pa.client, pa.am, pa.slots = existing.client, existing.am, existing.slots
+		return
+	}
+}
+
 // AddAccount hot-adds one validated account to the ring (admin API): no
 // restart, selectable by the very next Acquire. The account goes through
 // buildAccount, so a hot-added account is byte-identical to a startup-loaded
@@ -300,6 +325,7 @@ func (p *Pool) AddAccount(a Account) error {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.joinIdentity(pa)
 	p.accounts = append(p.accounts, pa)
 	// Grow the shared transport's idle pool so the new account's
 	// concurrency does not force TCP+TLS re-handshakes.
@@ -316,7 +342,9 @@ func (p *Pool) AddAccount(a Account) error {
 // email-only accounts) from selection, reporting whether anything was
 // removed. In-flight leases on the removed account are NOT disturbed — a
 // lease holds the *poolAccount reference, not a ring index — and their
-// Release still works (the channel outlives the ring entry). The upstream
+// Release still works (the channel outlives the ring entry). Re-adding an
+// identity after removal creates fresh runtime state; old leases cannot park
+// or release capacity on the new entry. The upstream
 // sessions and tokens of a removed account are left alone: removal only
 // stops new acquisitions.
 func (p *Pool) RemoveAccount(id string) bool {
@@ -586,6 +614,8 @@ func (l *Lease) NoteError(err error) {
 		return
 	}
 	be, _ := err.(*BizError)
+	l.pool.mu.Lock()
+	defer l.pool.mu.Unlock()
 	l.pa.am.mu.Lock()
 	defer l.pa.am.mu.Unlock()
 	switch BanKind(err) {
@@ -614,12 +644,20 @@ func (l *Lease) NoteError(err error) {
 	// Persist the park (TASK_MUTE): banned survives restarts forever; muted/
 	// risk windows must survive restarts so the account never re-hits the
 	// upstream and renews its window.
-	l.pool.notifyParkPersist(l.pa, ParkRecord{
-		Mobile: l.pa.account.Identity(),
-		Kind:   l.pa.am.ban,
-		Until:  l.pa.am.parkUntil,
-		Reason: l.pa.am.banMsg,
-	})
+	// A removed lease may finish after the same identity is re-added. Its
+	// manager is intentionally detached; never overwrite the new record's
+	// persisted health with an error from the old generation.
+	for _, active := range l.pool.accounts {
+		if active.am == l.pa.am {
+			l.pool.notifyParkPersist(l.pa, ParkRecord{
+				Mobile: l.pa.account.Identity(),
+				Kind:   l.pa.am.ban,
+				Until:  l.pa.am.parkUntil,
+				Reason: l.pa.am.banMsg,
+			})
+			break
+		}
+	}
 }
 
 // notifyParkPersist hands a park-state transition to the persistence sink.

@@ -111,3 +111,64 @@ func TestPoolDuplicateIdentitySharesParkState(t *testing.T) {
 		})
 	}
 }
+
+func TestPoolIdentityHotAddAndRemoveLateLease(t *testing.T) {
+	const id = "13800000000"
+	var parks []ParkRecord
+	p, err := NewPool([]Account{{Mobile: id, Password: "pw"}}, PoolConfig{
+		MaxInflight: 1, QueueWait: time.Millisecond,
+		OnParkPersist: func(r ParkRecord) { parks = append(parks, r) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := p.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.AddAccount(Account{Mobile: id, Password: "pw"}); err != nil {
+		t.Fatal(err)
+	}
+	if extra, err := p.Acquire(context.Background()); !errors.Is(err, ErrPoolBusy) {
+		if extra != nil {
+			extra.Release()
+		}
+		t.Fatalf("hot-added duplicate bypassed old lease: %v", err)
+	}
+	if !p.RemoveAccount(id) {
+		t.Fatal("expected removed identity")
+	}
+	if err := p.AddAccount(Account{Mobile: id, Password: "pw"}); err != nil {
+		t.Fatal(err)
+	}
+	newLease, err := p.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("fresh identity blocked by old lease: %v", err)
+	}
+	defer newLease.Release()
+	old.NoteError(&BizError{BizCode: 10, BizMsg: "USER_IS_BANNED"})
+	old.Release()
+	if len(parks) != 0 {
+		t.Fatalf("stale lease persisted %d parks on re-added identity", len(parks))
+	}
+	rows := p.Snapshot()
+	if len(rows) != 1 || rows[0].State != "ready" || rows[0].Inflight != 1 {
+		t.Fatalf("stale lease changed fresh identity: %+v", rows)
+	}
+}
+
+func TestPoolIdentityRestoredParkFromDuplicate(t *testing.T) {
+	const id = "13800000000"
+	p, err := NewPool([]Account{
+		{Mobile: id, Password: "pw"},
+		{Mobile: id, Password: "pw", ParkKind: "risk", ParkUntil: time.Now().Add(time.Hour).Format(time.RFC3339)},
+	}, PoolConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range p.Snapshot() {
+		if row.State != "risk" {
+			t.Fatalf("restored duplicate state: %s", row.State)
+		}
+	}
+}

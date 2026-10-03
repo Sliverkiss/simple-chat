@@ -388,47 +388,34 @@ func TestPoolConcurrentRotationAndCaps(t *testing.T) {
 	}
 	wg.Wait()
 }
-func TestPoolDuplicateEntriesAreSeparateSlots(t *testing.T) {
-	// accounts.json may legitimately repeat one credential (the live smoke
-	// test does this): each entry is its own ring slot with its own
-	// AccountManager, giving the same physical account more slots. Banning
-	// one slot must not kill the other.
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/v0/users/login", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"code":0,"msg":"","data":{"biz_code":0,"biz_msg":"","biz_data":{"user":{"token":"tok"}}}}`)
-	})
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-
-	accounts := []Account{
+func TestPoolDuplicateEntriesSharePhysicalIdentity(t *testing.T) {
+	pool, err := NewPool([]Account{
 		{Mobile: "13800000000", Password: "pw"},
 		{Mobile: "13800000000", Password: "pw"},
-	}
-	pool, err := NewPool(accounts, PoolConfig{BaseURL: srv.URL, MaxInflight: 1, QueueWait: 50 * time.Millisecond})
+	}, PoolConfig{MaxInflight: 1, QueueWait: time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n := len(pool.accounts); n != 2 {
-		t.Fatalf("pool has %d slots, want 2 (duplicate entries = separate slots)", n)
+	if n := len(pool.Snapshot()); n != 2 {
+		t.Fatalf("pool has %d rows, want 2", n)
 	}
-	// Both slots usable concurrently: each has its own semaphore.
-	l1, err := pool.Acquire(context.Background())
+	lease, err := pool.Acquire(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	l2, err := pool.Acquire(context.Background())
-	if err != nil {
-		t.Fatal(err)
+	defer lease.Release()
+	if other, err := pool.Acquire(context.Background()); !errors.Is(err, ErrPoolBusy) {
+		if other != nil {
+			other.Release()
+		}
+		t.Fatalf("duplicate must share capacity, got %v", err)
 	}
-	// Banning one slot leaves the other alive.
-	l1.NoteError(&BizError{BizCode: 10, BizMsg: "USER_IS_BANNED"})
-	l1.Release()
-	l2.Release()
-	l3, err := pool.Acquire(context.Background())
-	if err != nil {
-		t.Fatal(err)
+	lease.NoteError(&BizError{BizCode: 10, BizMsg: "USER_IS_BANNED"})
+	for _, row := range pool.Snapshot() {
+		if row.State != "banned" {
+			t.Fatalf("duplicate state = %s, want banned", row.State)
+		}
 	}
-	l3.Release()
 }
 
 func TestLeaseClientAndDelegates(t *testing.T) {
