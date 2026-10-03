@@ -93,16 +93,28 @@ func TestPoolLoginCarriesPerAccountDeviceID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for range accounts {
-		lease, err := pool.Acquire(context.Background())
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := lease.Token(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-		lease.Release()
+	first, err := pool.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
 	}
+	if _, err := first.Token(context.Background()); err != nil {
+		first.Release()
+		t.Fatal(err)
+	}
+	firstIdentity := first.Account().Identity()
+	first.Release()
+
+	// A second unqualified draw is not required to choose the other account.
+	// Exclude the first physical identity to exercise both login payloads.
+	second, _, err := pool.AcquireWithWaitExcluding(context.Background(), firstIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.Token(context.Background()); err != nil {
+		second.Release()
+		t.Fatal(err)
+	}
+	second.Release()
 
 	mu.Lock()
 	defer mu.Unlock()
