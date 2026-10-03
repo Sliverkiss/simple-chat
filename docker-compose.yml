@@ -2,7 +2,7 @@ services:
   simple-chat:
     build: .
     ports:
-      - "9879:8080"
+      - "127.0.0.1:9879:8080"
     volumes:
       # The file must be readable AND writable by uid 65532 (distroless
       # nonroot, persists per-account device ids on first boot) AND have 0600

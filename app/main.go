@@ -59,10 +59,12 @@ func redisHost(host string) string {
 	return u.Scheme + "://" + u.Host
 }
 
+func defaultListenAddress() string { return "127.0.0.1:8080" }
+
 func main() {
 	addr := os.Getenv("DS_ADDR")
 	if addr == "" {
-		addr = ":8080"
+		addr = defaultListenAddress()
 	}
 	accountsPath := os.Getenv("DS_ACCOUNTS")
 	if accountsPath == "" {
