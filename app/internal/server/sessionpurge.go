@@ -113,10 +113,8 @@ type purgeScheduler struct {
 	// loop / pass — never both.
 	rng *rand.Rand
 
-	// overrideNextUnix, when non-zero, replaces the computed next fire
-	// time (test seam for driving the background loop). Read freshly
-	// on every wait slice so a late override takes effect; atomic
-	// because the test writes it while the loop goroutine runs.
+	// overrideNextUnix is a one-shot test wake override. Clear it when the
+	// loop fires so a past target cannot force repeated immediate purges.
 	overrideNextUnix atomic.Int64
 
 	// started records that the loop goroutine was launched (enabled).
@@ -201,6 +199,7 @@ func (s *purgeScheduler) loop() {
 			case <-time.After(purgeWaitSlice):
 			}
 		}
+		s.overrideNextUnix.Store(0)
 		s.pass(context.Background())
 	}
 }
@@ -210,8 +209,8 @@ func (s *purgeScheduler) loop() {
 // up without busy-waiting. 200ms is invisible next to a weekly cadence.
 const purgeWaitSlice = 200 * time.Millisecond
 
-// nextWake returns the next fire time: the test override when set,
-// else the next jittered weekly slot from now.
+// nextWake returns the next fire time: the pending one-shot test override
+// when set, else the next jittered weekly slot from now.
 func (s *purgeScheduler) nextWake(now time.Time) time.Time {
 	if v := s.overrideNextUnix.Load(); v != 0 {
 		return time.Unix(v, 0)
