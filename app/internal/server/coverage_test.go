@@ -156,7 +156,11 @@ func TestPoolStatusReportsStates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	l, _ := pool.Acquire(context.Background())
+	l, err := pool.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	riskMobile := l.Account().Mobile
 	l.NoteError(&upstream.BizError{BizCode: 11, BizMsg: "RISK_DEVICE_DETECTED"})
 	l.Release()
 	st := pool.Status()
@@ -167,11 +171,15 @@ func TestPoolStatusReportsStates(t *testing.T) {
 	for _, row := range st {
 		found[row["mobile"].(string)] = row["state"].(string)
 	}
-	if found["13800000000"] != "risk" {
-		t.Errorf("first account state = %q, want risk", found["13800000000"])
+	otherMobile := "13800000000"
+	if riskMobile == otherMobile {
+		otherMobile = "13900000000"
 	}
-	if found["13900000000"] != "ready" {
-		t.Errorf("second account state = %q, want ready", found["13900000000"])
+	if found[riskMobile] != "risk" {
+		t.Errorf("leased account state = %q, want risk", found[riskMobile])
+	}
+	if found[otherMobile] != "ready" {
+		t.Errorf("other account state = %q, want ready", found[otherMobile])
 	}
 }
 
