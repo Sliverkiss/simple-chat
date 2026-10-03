@@ -135,6 +135,9 @@ func (s *Server) handleAdminUpload(w http.ResponseWriter, r *http.Request) {
 		accounts = append(accounts, a)
 	}
 
+	s.adminLifecycleMu.Lock()
+	defer s.adminLifecycleMu.Unlock()
+
 	// Duplicate check against the persisted records AND the batch itself:
 	// same identity (mobile, else email) → 409 with the existing record.
 	existing, err := s.store.Load(r.Context())
@@ -277,6 +280,9 @@ func (s *Server) handleAdminDelete(w http.ResponseWriter, r *http.Request) {
 		writeAdminError(w, http.StatusServiceUnavailable, "no account store configured (set DS_ACCOUNTS or DS_REDIS_HOST)")
 		return
 	}
+	s.adminLifecycleMu.Lock()
+	defer s.adminLifecycleMu.Unlock()
+
 	// Echo needs the full record; read it before deleting.
 	snaps := s.pool.Snapshot()
 	var removed *upstream.Account

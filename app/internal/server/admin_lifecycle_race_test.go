@@ -22,12 +22,11 @@ type lifecycleStore struct {
 	mu   sync.Mutex
 	rows map[string]upstream.Account
 
-	deleted         chan struct{}
-	resumeDelete    chan struct{}
-	loadedTwice     chan struct{}
-	resumeLoads     chan struct{}
-	loads           int
-	allowSecondSave <-chan struct{}
+	deleted      chan struct{}
+	resumeDelete chan struct{}
+	loadedTwice  chan struct{}
+	resumeLoads  chan struct{}
+	loads        int
 }
 
 var _ accountstore.Store = (*lifecycleStore)(nil)
@@ -51,9 +50,6 @@ func (s *lifecycleStore) Load(context.Context) ([]upstream.Account, error) {
 	return rows, nil
 }
 func (s *lifecycleStore) SaveAccount(_ context.Context, a upstream.Account) error {
-	if a.Password == "second" && s.allowSecondSave != nil {
-		<-s.allowSecondSave
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.rows[a.Identity()] = a
@@ -198,8 +194,6 @@ func TestAdminLifecycleDeleteUploadSameIdentitySerializes(t *testing.T) {
 func TestAdminLifecycleConcurrentDuplicateUploadsConflict(t *testing.T) {
 	const id = "double@example.test"
 	store := &lifecycleStore{rows: map[string]upstream.Account{}, loadedTwice: make(chan struct{}), resumeLoads: make(chan struct{})}
-	secondSave := make(chan struct{})
-	store.allowSecondSave = secondSave
 	srv, s := lifecycleServer(t, store, nil)
 	results := make(chan lifecycleResult, 2)
 	for _, password := range []string{"first", "second"} {
@@ -209,7 +203,6 @@ func TestAdminLifecycleConcurrentDuplicateUploadsConflict(t *testing.T) {
 	lifecycleWait(t, store.loadedTwice, "both duplicate-check Loads")
 	close(store.resumeLoads)
 	first := lifecycleReceive(t, results, "first upload result")
-	close(secondSave)
 	second := lifecycleReceive(t, results, "second upload result")
 	loaded, err := store.Load(context.Background())
 	if err != nil || len(loaded) != 1 {

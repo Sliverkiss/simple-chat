@@ -16,6 +16,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"simple-chat/internal/accountstore"
@@ -102,6 +103,8 @@ type Server struct {
 	sessions  *sessionRegistry
 	cleanup   *cleanupScheduler
 	purge     *purgeScheduler
+	// adminLifecycleMu serializes upload/delete across store and pool mutations.
+	adminLifecycleMu sync.Mutex
 	// store persists accounts for the admin API (upload/delete); nil when
 	// the server runs store-less (admin mutations then answer 500 with a
 	// clear message instead of mutating a pool that forgets on restart).
