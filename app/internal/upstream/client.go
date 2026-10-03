@@ -1105,12 +1105,14 @@ func (c *Client) fileStatus(ctx context.Context, token, fileID string) (string, 
 type AccountManager struct {
 	client *Client
 
-	mu            sync.Mutex
-	token         string
-	ban           BanState
-	banMsg        string
-	parkUntil     time.Time
-	cooldownUntil time.Time // transient per-identity parallel-limit throttle
+	mu              sync.Mutex
+	token           string
+	ban             BanState
+	banMsg          string
+	parkUntil       time.Time
+	cooldownUntil   time.Time // transient per-identity parallel-limit throttle
+	muteParkDefault time.Duration
+	riskCooldown    time.Duration
 	// startupFired guards the one-shot app-launch sequence (users/current
 	// then fetch_page) that fires on the empty→token transition — once per
 	// process per account (apk-behavior.md §8 D2).
@@ -1134,6 +1136,9 @@ func (c *Client) AccountManager() *AccountManager {
 func (am *AccountManager) Token(ctx context.Context) (string, error) {
 	am.mu.Lock()
 	defer am.mu.Unlock()
+	if (am.ban == BanMuted || am.ban == BanRiskDevice) && !am.parkUntil.IsZero() && time.Now().After(am.parkUntil) {
+		am.ban, am.banMsg, am.parkUntil = BanNone, "", time.Time{}
+	}
 	if am.ban != BanNone {
 		return "", fmt.Errorf("upstream: account unavailable: %s", am.banMsg)
 	}
@@ -1177,15 +1182,34 @@ func (am *AccountManager) fireStartupSequence(tok string) {
 
 // markBan records ban/mute states from an upstream error.
 func (am *AccountManager) markBan(err error) {
+	be, _ := err.(*BizError)
 	switch BanKind(err) {
 	case BanBanned:
 		am.ban = BanBanned
+		am.parkUntil = time.Time{}
 		am.banMsg = "account banned: " + err.Error()
 	case BanMuted:
 		am.ban = BanMuted
+		until := time.Time{}
+		if be != nil {
+			until = be.MuteUntil
+		}
+		if until.IsZero() || until.Before(time.Now()) {
+			duration := am.muteParkDefault
+			if duration <= 0 {
+				duration = 6 * time.Hour
+			}
+			until = time.Now().Add(duration)
+		}
+		am.parkUntil = until
 		am.banMsg = "account muted: " + err.Error()
 	case BanRiskDevice:
 		am.ban = BanRiskDevice
+		duration := am.riskCooldown
+		if duration <= 0 {
+			duration = 10 * time.Minute
+		}
+		am.parkUntil = time.Now().Add(duration)
 		am.banMsg = "risk device detected: " + err.Error()
 	}
 }

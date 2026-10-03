@@ -266,6 +266,8 @@ func (p *Pool) buildAccount(a Account) (*poolAccount, error) {
 	})
 	client.SetTransport(p.transport)
 	client.SetLogger(p.cfg.Logger)
+	client.AccountManager().muteParkDefault = p.cfg.MuteParkDefault
+	client.AccountManager().riskCooldown = p.cfg.RiskCooldown
 	active := &atomic.Bool{}
 	active.Store(true)
 	var generation uint64
