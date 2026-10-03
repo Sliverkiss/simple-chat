@@ -151,6 +151,9 @@ func switchAccounts() []upstream.Account {
 	return []upstream.Account{{Mobile: "13800000000", Password: "fixture"}, {Mobile: "13900000000", Password: "fixture"}}
 }
 
+// assertSwitchCalls verifies identity/session binding and unchanged prompt.
+// Distinct physical identities are required by switch tests, not by safe
+// single-account fallback tests.
 func assertSwitchCalls(t *testing.T, f *switchFixture, count int) []switchCall {
 	t.Helper()
 	calls, created := f.snapshot()
@@ -207,25 +210,37 @@ func TestPlainChatNoRetryAfterFirstSSEDelta(t *testing.T) {
 	assertSwitchCalls(t, f, 1)
 }
 
-func TestPlainChatSingleAccountRetryFailsSafelyWithoutSelfRetry(t *testing.T) {
+func TestPlainChatSingleAccountRetryPolicy(t *testing.T) {
 	for _, tc := range []struct {
 		failure string
 		status  int
 		code    string
+		calls   int
 	}{
-		{"parallel", http.StatusTooManyRequests, `"code":"parallel_chat_limit"`},
-		{"http500", http.StatusBadGateway, `"code":"upstream_failure"`},
-		{"cut", http.StatusBadGateway, `"code":"stream_error"`},
-		{"empty", http.StatusOK, `"content":""`},
+		{"parallel", http.StatusTooManyRequests, `"code":"parallel_chat_limit"`, 1},
+		{"http500", http.StatusOK, "switched-answer", 2},
+		{"cut", http.StatusOK, "switched-answer", 2},
+		{"empty", http.StatusOK, "switched-answer", 2},
 	} {
 		t.Run(tc.failure, func(t *testing.T) {
 			f := newSwitchFixture(t, tc.failure)
 			gw := newSwitchGateway(t, f, switchAccounts()[:1])
 			status, body := postSwitchChat(t, gw, false)
-			if status != tc.status || !strings.Contains(body, tc.code) || strings.Contains(body, "switched-answer") {
+			if status != tc.status || !strings.Contains(body, tc.code) {
 				t.Errorf("single-account fallback = %d %s, want %d %s", status, body, tc.status, tc.code)
 			}
-			assertSwitchCalls(t, f, 1)
+			calls, created := f.snapshot()
+			if len(calls) != tc.calls {
+				t.Fatalf("completion calls = %+v, want %d", calls, tc.calls)
+			}
+			for _, c := range calls {
+				if c.identity == "" || created[c.session] != c.identity || c.prompt != switchPrompt {
+					t.Errorf("invalid fallback attempt: %+v created=%v", c, created)
+				}
+			}
+			if tc.calls == 2 && calls[0].session == calls[1].session {
+				t.Errorf("safe fallback reused session: %+v", calls)
+			}
 		})
 	}
 }
