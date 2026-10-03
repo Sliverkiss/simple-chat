@@ -5,14 +5,55 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 )
+
+func allowLocalImageTestServer(t *testing.T) {
+	t.Helper()
+	old := imageURLValidation
+	imageURLValidation = func(*url.URL) error { return nil }
+	oldClient := imageHTTPClient
+	imageHTTPClient = &http.Client{Timeout: imageFetchTimeout}
+	t.Cleanup(func() { imageURLValidation = old; imageHTTPClient = oldClient })
+}
+
+func TestValidateImageURLRejectsPrivateAddresses(t *testing.T) {
+	for _, raw := range []string{
+		"http://127.0.0.1/image.png",
+		"http://10.0.0.1/image.png",
+		"http://192.168.1.1/image.png",
+		"http://[::1]/image.png",
+		"http://169.254.169.254/latest/meta-data/",
+	} {
+		u, err := url.Parse(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := validateImageURL(u); err == nil {
+			t.Errorf("%s: private address was accepted", raw)
+		}
+	}
+}
+
+func TestValidateImageURLRequiresHTTP(t *testing.T) {
+	for _, raw := range []string{"file:///etc/passwd", "gopher://127.0.0.1:6379/INFO", "data:image/png;base64,aA=="} {
+		u, err := url.Parse(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := validateImageURL(u); err == nil {
+			t.Errorf("%s: non-http scheme was accepted", raw)
+		}
+	}
+}
 
 // A hanging image server must not stall extraction forever: the fetch is
 // bounded by the request context (and a 30s client timeout), and the failure
 // surfaces as an error instead of a silent skip (gap-analysis R4).
 func TestExtractImagesHangingServerFailsFast(t *testing.T) {
+	allowLocalImageTestServer(t)
 	block := make(chan struct{})
 	defer close(block)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -60,6 +101,7 @@ func TestExtractImagesHangingServerFailsFast(t *testing.T) {
 // Client cancellation must abort an in-flight fetch (context threaded through
 // the request, not just a blanket timeout).
 func TestExtractImagesContextCancelAborts(t *testing.T) {
+	allowLocalImageTestServer(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		<-r.Context().Done()
 	}))
@@ -91,6 +133,7 @@ func TestExtractImagesContextCancelAborts(t *testing.T) {
 // must surface as an error — silently dropping a requested image produces a
 // completion the client thinks includes it.
 func TestExtractImagesBadResponsesError(t *testing.T) {
+	allowLocalImageTestServer(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/gone":

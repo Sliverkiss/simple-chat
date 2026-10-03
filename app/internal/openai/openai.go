@@ -9,7 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -120,15 +122,15 @@ type Request struct {
 // (enumerated only so stripping is visible in the debug log). Anything not
 // listed here is dropped by json.Unmarshal ignoring unknown keys.
 type parseRaw struct {
-	Model       string          `json:"model"`
-	Messages    json.RawMessage `json:"messages"`
-	Stream      bool            `json:"stream"`
-	Temperature        float64  `json:"temperature"`
-	TopP               float64  `json:"top_p"`
-	MaxTokens          int      `json:"max_tokens"`
-	MaxCompletionToken int      `json:"max_completion_tokens"`
-	Thinking    json.RawMessage `json:"thinking"`
-	Search      json.RawMessage `json:"search"`
+	Model              string          `json:"model"`
+	Messages           json.RawMessage `json:"messages"`
+	Stream             bool            `json:"stream"`
+	Temperature        float64         `json:"temperature"`
+	TopP               float64         `json:"top_p"`
+	MaxTokens          int             `json:"max_tokens"`
+	MaxCompletionToken int             `json:"max_completion_tokens"`
+	Thinking           json.RawMessage `json:"thinking"`
+	Search             json.RawMessage `json:"search"`
 
 	Tools             json.RawMessage `json:"tools"`
 	ToolChoice        json.RawMessage `json:"tool_choice"`
@@ -470,7 +472,62 @@ const imageFetchTimeout = 30 * time.Second
 // imageHTTPClient fetches client-supplied image URLs. Dedicated client: the
 // default one carries no timeout, and the upstream client's transport/tuning
 // must not be shared with arbitrary external hosts.
-var imageHTTPClient = &http.Client{Timeout: imageFetchTimeout}
+var imageURLValidation = validateImageURL
+
+var imageHTTPClient = &http.Client{
+	Timeout: imageFetchTimeout,
+	Transport: &http.Transport{
+		Proxy:       http.ProxyFromEnvironment,
+		DialContext: safeImageDialContext,
+	},
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if err := imageURLValidation(req.URL); err != nil {
+			return err
+		}
+		if len(via) >= 5 {
+			return http.ErrUseLastResponse
+		}
+		return nil
+	},
+}
+
+func safeImageDialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return nil, err
+	}
+	dialer := &net.Dialer{Timeout: imageFetchTimeout}
+	for _, ip := range ips {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsInterfaceLocalMulticast() {
+			continue
+		}
+		conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+	}
+	return nil, errors.New("image host resolved only to non-public addresses or could not connect")
+}
+
+func validateImageURL(u *url.URL) error {
+	if u == nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+		return errors.New("image URL must use http or https")
+	}
+	ips, err := net.LookupIP(u.Hostname())
+	if err != nil {
+		return fmt.Errorf("image host lookup failed")
+	}
+	for _, ip := range ips {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsInterfaceLocalMulticast() {
+			return fmt.Errorf("image host resolves to a non-public address")
+		}
+	}
+	return nil
+}
 
 // ExtractImages pulls image_url parts out of the messages: data URLs decode
 // inline; http(s) URLs are fetched server-side (10 MB cap, image content type
@@ -532,32 +589,36 @@ func decodeDataURL(u string) ([]byte, string, bool) {
 // fetchImage downloads an http(s) image URL, honoring ctx and bounded by
 // imageFetchTimeout. ext == "" with a nil error means "not an http(s) URL" —
 // the only non-error skip left.
-func fetchImage(ctx context.Context, u string) ([]byte, string, error) {
-	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
-		return nil, "", nil
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil) //nolint:gosec // client-supplied URL by design
+func fetchImage(ctx context.Context, raw string) ([]byte, string, error) {
+	u, err := url.Parse(raw)
 	if err != nil {
-		return nil, "", fmt.Errorf("image url %q: %w", firstSegment(u), err)
+		return nil, "", fmt.Errorf("invalid image URL")
+	}
+	if err := imageURLValidation(u); err != nil {
+		return nil, "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil) //nolint:gosec // validated URL
+	if err != nil {
+		return nil, "", fmt.Errorf("invalid image URL")
 	}
 	resp, err := imageHTTPClient.Do(req)
 	if err != nil {
-		return nil, "", fmt.Errorf("image fetch %q: %w", firstSegment(u), err)
+		return nil, "", fmt.Errorf("image fetch %q: %w", firstSegment(u.String()), err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, "", fmt.Errorf("image fetch %q: http %d", firstSegment(u), resp.StatusCode)
+		return nil, "", fmt.Errorf("image fetch %q: http %d", firstSegment(u.String()), resp.StatusCode)
 	}
 	ext := imageExtByMIME(resp.Header.Get("Content-Type"))
 	if ext == "" {
-		return nil, "", fmt.Errorf("image fetch %q: unsupported content type %q", firstSegment(u), resp.Header.Get("Content-Type"))
+		return nil, "", fmt.Errorf("image fetch %q: unsupported content type %q", firstSegment(u.String()), resp.Header.Get("Content-Type"))
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20+1))
 	if err != nil {
-		return nil, "", fmt.Errorf("image fetch %q: %w", firstSegment(u), err)
+		return nil, "", fmt.Errorf("image fetch %q: %w", firstSegment(u.String()), err)
 	}
 	if len(data) > 10<<20 {
-		return nil, "", fmt.Errorf("image fetch %q: exceeds 10MB cap", firstSegment(u))
+		return nil, "", fmt.Errorf("image fetch %q: exceeds 10MB cap", firstSegment(u.String()))
 	}
 	return data, ext, nil
 }

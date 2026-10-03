@@ -159,6 +159,7 @@ func TestExtractImagesDataURL(t *testing.T) {
 }
 
 func TestExtractImagesHTTPURL(t *testing.T) {
+	allowLocalImageTestServer(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
 		w.Write([]byte("pngbytes"))
