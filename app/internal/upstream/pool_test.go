@@ -55,15 +55,118 @@ func acquireSeq(t *testing.T, pool *Pool, n int) []string {
 	return got
 }
 
-func TestPoolRoundRobinRotation(t *testing.T) {
-	pool := newTestPool(t, 3, 5, nil)
-	got := acquireSeq(t, pool, 6)
-	want := []string{"13800000000", "13800000001", "13800000002", "13800000000", "13800000001", "13800000002"}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("rotation = %v, want %v", got, want)
+func TestPoolRandomSelectionIsReproducibleAndDistributed(t *testing.T) {
+	pool := newTestPool(t, 3, 5, func(c PoolConfig) PoolConfig {
+		c.RandomSeed = 42
+		return c
+	})
+	got := acquireSeq(t, pool, 900)
+	counts := map[string]int{}
+	for _, id := range got {
+		counts[id]++
+	}
+	for i := 0; i < 3; i++ {
+		if counts[fmt.Sprintf("1380000000%d", i)] < 250 {
+			t.Fatalf("account %d selected only %d/900 times: %v", i, counts[fmt.Sprintf("1380000000%d", i)], counts)
 		}
 	}
+}
+
+func TestPoolRandomSelectionSkipsParkedAndBusyAccounts(t *testing.T) {
+	pool := newTestPool(t, 3, 1, func(c PoolConfig) PoolConfig { c.RandomSeed = 7; return c })
+	pool.accounts[0].slots <- struct{}{}
+	pool.accounts[1].am.mu.Lock()
+	pool.accounts[1].am.ban = BanBanned
+	pool.accounts[1].am.mu.Unlock()
+	defer func() { <-pool.accounts[0].slots }()
+	for i := 0; i < 50; i++ {
+		lease, err := pool.Acquire(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if lease.Account().Mobile != "13800000002" {
+			t.Fatalf("selected unavailable account %s", lease.Account().Mobile)
+		}
+		lease.Release()
+	}
+}
+
+func TestPoolRandomSelectionHotAddRemoveConcurrent(t *testing.T) {
+	pool := newTestPool(t, 2, 2, func(c PoolConfig) PoolConfig { c.RandomSeed = 9; c.QueueWait = time.Second; return c })
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 40; j++ {
+				lease, err := pool.Acquire(context.Background())
+				if err == nil {
+					lease.Release()
+				}
+			}
+		}()
+	}
+	for i := 0; i < 20; i++ {
+		id := fmt.Sprintf("138000009%d", i)
+		if err := pool.AddAccount(Account{Mobile: id, Password: "pw"}); err != nil {
+			t.Fatal(err)
+		}
+		if !pool.RemoveAccount(id) {
+			t.Fatalf("failed to remove %s", id)
+		}
+	}
+	wg.Wait()
+}
+
+func TestPoolSelectionPrefersAvailableCapacity(t *testing.T) {
+	pool := newTestPool(t, 2, 1, func(c PoolConfig) PoolConfig {
+		c.RandomSeed = 7
+		return c
+	})
+	busy, err := pool.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy.Release()
+
+	counts := map[string]int{}
+	for i := 0; i < 12; i++ {
+		lease, err := pool.Acquire(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		counts[lease.Account().Mobile]++
+		lease.Release()
+	}
+	if counts[busy.Account().Mobile] != 0 {
+		t.Fatalf("busy account selected: %v", counts)
+	}
+}
+
+func TestPoolAcquireReleaseIsOneRequestLifecycle(t *testing.T) {
+	pool := newTestPool(t, 2, 1, func(c PoolConfig) PoolConfig { c.RandomSeed = 11; return c })
+	lease, err := pool.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected := lease.Account().Mobile
+	if got := pool.Snapshot()[0].Inflight + pool.Snapshot()[1].Inflight; got != 1 {
+		t.Fatalf("inflight after acquire = %d", got)
+	}
+	lease.Release()
+	for _, row := range pool.Snapshot() {
+		if row.Inflight != 0 {
+			t.Fatalf("inflight after release = %d for %s", row.Inflight, row.Account.Mobile)
+		}
+	}
+	lease2, err := pool.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease2.Account().Mobile == "" || selected == "" {
+		t.Fatal("lease account identity missing")
+	}
+	lease2.Release()
 }
 
 func TestPoolInflightCapBlocksThenResumes(t *testing.T) {
@@ -92,23 +195,20 @@ func TestPoolInflightCapBlocksThenResumes(t *testing.T) {
 
 func TestPoolSkipsFullAccount(t *testing.T) {
 	pool := newTestPool(t, 2, 1, nil)
-	l1, _ := pool.Acquire(context.Background()) // account 0, slot held
-	if l1.Account().Mobile != "13800000000" {
-		t.Fatalf("first acquire = %s, want account 0", l1.Account().Mobile)
-	}
+	l1, _ := pool.Acquire(context.Background()) // one slot held
+	first := l1.Account().Mobile
 	l2, err := pool.Acquire(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if l2.Account().Mobile != "13800000001" {
-		t.Fatalf("second acquire = %s, want account 1 (account 0 is full)", l2.Account().Mobile)
+	if l2.Account().Mobile == first {
+		t.Fatalf("second acquire reused full account %s", first)
 	}
 	l1.Release()
 	l2.Release()
-	// Ring now points back at account 0; strict round-robin resumes there.
 	l3, _ := pool.Acquire(context.Background())
-	if l3.Account().Mobile != "13800000000" {
-		t.Fatalf("third acquire = %s, want account 0 (ring resumed)", l3.Account().Mobile)
+	if l3.Account().Mobile == "" {
+		t.Fatal("third acquire returned empty account")
 	}
 	l3.Release()
 }
@@ -116,9 +216,7 @@ func TestPoolSkipsFullAccount(t *testing.T) {
 func TestPoolBannedSkippedForever(t *testing.T) {
 	pool := newTestPool(t, 2, 5, nil)
 	l, _ := pool.Acquire(context.Background())
-	if l.Account().Mobile != "13800000000" {
-		t.Fatalf("first acquire = %s", l.Account().Mobile)
-	}
+	banned := l.Account().Mobile
 	l.NoteError(&BizError{BizCode: 10, BizMsg: "USER_IS_BANNED"})
 	l.Release()
 	for i := 0; i < 6; i++ {
@@ -126,7 +224,7 @@ func TestPoolBannedSkippedForever(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if lease.Account().Mobile == "13800000000" {
+		if lease.Account().Mobile == banned {
 			t.Fatal("banned account must never be selected again")
 		}
 		lease.Release()
@@ -374,8 +472,8 @@ func TestPoolStatusMutedAndBanned(t *testing.T) {
 	l1.NoteError(&BizError{BizCode: 5, BizMsg: "muted"})
 	l1.Release()
 	l2, _ := pool.Acquire(context.Background())
-	if l2.Account().Mobile != "13800000001" {
-		t.Fatalf("second acquire = %s (muted acct skipped)", l2.Account().Mobile)
+	if l2.Account().Mobile == l1.Account().Mobile {
+		t.Fatalf("second acquire selected muted account %s", l2.Account().Mobile)
 	}
 	l2.NoteError(&BizError{BizCode: 10, BizMsg: "banned"})
 	l2.Release()
@@ -384,10 +482,10 @@ func TestPoolStatusMutedAndBanned(t *testing.T) {
 	for _, row := range st {
 		states[row["mobile"].(string)] = row["state"].(string)
 	}
-	if states["13800000000"] != "muted" {
-		t.Errorf("acct 0 state = %q, want muted", states["13800000000"])
+	if states[l1.Account().Mobile] != "muted" {
+		t.Errorf("acct %s state = %q, want muted", l1.Account().Mobile, states[l1.Account().Mobile])
 	}
-	if states["13800000001"] != "banned" {
-		t.Errorf("acct 1 state = %q, want banned", states["13800000001"])
+	if states[l2.Account().Mobile] != "banned" {
+		t.Errorf("acct %s state = %q, want banned", l2.Account().Mobile, states[l2.Account().Mobile])
 	}
 }

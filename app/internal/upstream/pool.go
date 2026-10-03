@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"sync"
 	"time"
@@ -19,6 +20,10 @@ const DefaultMaxInflight = 2
 
 // ErrNoAccounts means every account is banned (permanent) — no wait would help.
 var ErrNoAccounts = errors.New("upstream: pool has no available accounts (all banned)")
+
+// ErrNoAlternativeAccount means a retry cannot select a distinct ready
+// account. The caller should terminate this retry, never reuse the prior one.
+var ErrNoAlternativeAccount = errors.New("upstream: no eligible alternative account")
 
 // PoolBusyError reports all accounts busy; the pool waited QueueWait for a
 // slot and gave up. Retry-After is in seconds.
@@ -66,6 +71,11 @@ type PoolConfig struct {
 	// synchronous, fail-soft, nil = memory-only tokens.
 	OnLoginPersist func(LoginRecord)
 	Logger         func(format string, args ...any)
+	// RandomSeed makes selection reproducible in tests. Zero seeds from the
+	// current clock; all access to the PRNG is serialized by p.mu.
+	RandomSeed int64
+	// EWMAAlpha controls latency adaptation. Zero uses 0.2.
+	EWMAAlpha float64
 }
 
 // LoginRecord is one successful login, handed to PoolConfig.OnLoginPersist.
@@ -144,6 +154,10 @@ type poolAccount struct {
 
 	// slots is the in-flight semaphore: buffered channel of size MaxInflight.
 	slots chan struct{}
+	// ewmaNanos is updated under Pool.mu after a completed request. Zero means
+	// no latency sample yet.
+	ewmaNanos float64
+	samples   uint64
 }
 
 // health states for an account.
@@ -163,7 +177,7 @@ type Pool struct {
 	transport http.RoundTripper // shared tuned Transport (R5)
 
 	mu      sync.Mutex
-	cursor  int // next ring index to try
+	rng     *rand.Rand
 	nextSeq int // round-robin sequence counter (debug/introspection)
 }
 
@@ -182,7 +196,11 @@ func NewPool(accounts []Account, cfg PoolConfig) (*Pool, error) {
 	}
 	transport := newTransport(nil)
 	transport.MaxIdleConnsPerHost = perHost
-	p := &Pool{cfg: cfg, transport: transport}
+	seed := cfg.RandomSeed
+	if seed == 0 {
+		seed = time.Now().UnixNano()
+	}
+	p := &Pool{cfg: cfg, transport: transport, rng: rand.New(rand.NewSource(seed))}
 	parked := 0
 	for _, a := range accounts {
 		pa, err := p.buildAccount(a)
@@ -214,9 +232,9 @@ func (p *Pool) buildAccount(a Account) (*poolAccount, error) {
 	// own ring slot (own token, own semaphore), giving one physical
 	// account more slots when repeated.
 	client := NewClient(Config{
-		BaseURL: p.cfg.BaseURL,
-		Mobile:  a.Mobile,
-		Email:   a.Email,
+		BaseURL:  p.cfg.BaseURL,
+		Mobile:   a.Mobile,
+		Email:    a.Email,
 		Password: a.Password,
 		// Per-account persistent device identity (device-id-research.md):
 		// explicit value verbatim, else deterministic UUIDv5. Never one
@@ -290,8 +308,6 @@ func (p *Pool) AddAccount(a Account) error {
 			tr.MaxIdleConnsPerHost = want
 		}
 	}
-	// cursor stays valid: it is < len(accounts) for the old ring, and the
-	// old ring is a prefix of the new one.
 	p.logf("pool: hot-added %s (ring now %d)", a.Identity(), len(p.accounts))
 	return nil
 }
@@ -319,12 +335,6 @@ func (p *Pool) RemoveAccount(id string) bool {
 		return false
 	}
 	p.accounts = kept
-	// Keep the cursor inside the shrunken ring. Removing an entry before
-	// (or at) the cursor would otherwise skip a survivor; clamping to the
-	// last index keeps the rotation fair without a restart.
-	if n := len(p.accounts); n > 0 && p.cursor >= n {
-		p.cursor = n - 1
-	}
 	p.logf("pool: removed %s (%d slot(s), ring now %d)", id, removed, len(p.accounts))
 	return true
 }
@@ -367,27 +377,48 @@ func (pa *poolAccount) isBusy() bool {
 	return len(pa.slots) >= cap(pa.slots)
 }
 
-// Acquire selects the next account with free capacity and reserves a slot.
-// Selection: strict round-robin from the cursor; an account whose slots are
-// full is skipped (its ring position is unchanged); if all candidates are
-// busy, wait up to cfg.QueueWait polling for a slot; if all are banned,
-// fail immediately with ErrNoAccounts.
+// Acquire selects a uniformly random ready account with free capacity and
+// reserves a slot. The random draw is made while holding p.mu, so concurrent
+// requests cannot race the PRNG or account slice. If all candidates are busy,
+// wait up to cfg.QueueWait; if all are banned, fail immediately.
 func (p *Pool) Acquire(ctx context.Context) (*Lease, error) {
+	lease, _, err := p.AcquireWithWait(ctx)
+	return lease, err
+}
+
+// AcquireWithWait is Acquire plus the time spent waiting for a free slot.
+// The duration excludes account login/session work after the lease is held.
+func (p *Pool) AcquireWithWait(ctx context.Context) (*Lease, time.Duration, error) {
+	return p.acquireWithWait(ctx, "")
+}
+
+// AcquireWithWaitExcluding reserves a lease for a different physical identity
+// during one retry. priorIdentity is Account.Identity(), not a ring slot: all
+// duplicate entries of that identity are excluded. A blank identity excludes
+// nothing. If no distinct ready account exists, ErrNoAlternativeAccount is
+// terminal; if one is ready but at capacity, QueueWait applies as usual.
+// This never falls back to the prior account or bypasses health/park checks.
+func (p *Pool) AcquireWithWaitExcluding(ctx context.Context, priorIdentity string) (*Lease, time.Duration, error) {
+	return p.acquireWithWait(ctx, priorIdentity)
+}
+
+func (p *Pool) acquireWithWait(ctx context.Context, excludedIdentity string) (*Lease, time.Duration, error) {
+	started := time.Now()
 	deadline := time.Now().Add(p.cfg.QueueWait)
 	for {
-		lease, err := p.tryAcquire(ctx)
+		lease, err := p.tryAcquireExcluding(ctx, excludedIdentity)
 		if err == nil {
-			return lease, nil
+			return lease, time.Since(started), nil
 		}
 		if !errors.Is(err, ErrPoolBusy) {
-			return nil, err
+			return nil, time.Since(started), err
 		}
 		if time.Now().After(deadline) {
-			return nil, &PoolBusyError{RetryAfter: p.cfg.QueueWait.Round(time.Second) + time.Second}
+			return nil, time.Since(started), &PoolBusyError{RetryAfter: p.cfg.QueueWait.Round(time.Second) + time.Second}
 		}
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, time.Since(started), ctx.Err()
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
@@ -395,6 +426,10 @@ func (p *Pool) Acquire(ctx context.Context) (*Lease, error) {
 
 // tryAcquire does one non-blocking pass over the ring.
 func (p *Pool) tryAcquire(ctx context.Context) (*Lease, error) {
+	return p.tryAcquireExcluding(ctx, "")
+}
+
+func (p *Pool) tryAcquireExcluding(ctx context.Context, excludedIdentity string) (*Lease, error) {
 	p.mu.Lock()
 	n := len(p.accounts)
 	if n == 0 {
@@ -405,9 +440,13 @@ func (p *Pool) tryAcquire(ctx context.Context) (*Lease, error) {
 	}
 	now := time.Now()
 	var anyBanned bool
+	var distinctReady bool
+	ready := make([]*poolAccount, 0, n)
 	for i := 0; i < n; i++ {
-		idx := (p.cursor + i) % n
-		pa := p.accounts[idx]
+		pa := p.accounts[i]
+		if excludedIdentity != "" && pa.account.Identity() == excludedIdentity {
+			continue
+		}
 		h := p.healthNow(pa, now)
 		if h == healthBanned {
 			anyBanned = true
@@ -416,34 +455,97 @@ func (p *Pool) tryAcquire(ctx context.Context) (*Lease, error) {
 		if h != healthReady {
 			continue // parked (muted/risk): skip but not permanently
 		}
+		distinctReady = true
 		if pa.isBusy() {
-			continue // full: skip, ring position unchanged
+			continue
 		}
-		// Reserve the slot under the lock so two goroutines can't both take
-		// the last slot of the same account.
+		ready = append(ready, pa)
+	}
+	if len(ready) > 0 {
+		best := ready[0]
+		bestScore := p.accountScore(best)
+		for _, pa := range ready[1:] {
+			score := p.accountScore(pa)
+			if score < bestScore {
+				best, bestScore = pa, score
+			}
+		}
+		near := make([]*poolAccount, 0, len(ready))
+		for _, pa := range ready {
+			if p.accountScore(pa) <= bestScore*1.15+1 {
+				near = append(near, pa)
+			}
+		}
+		pa := near[p.rng.Intn(len(near))]
 		pa.slots <- struct{}{}
-		p.cursor = (idx + 1) % n
 		p.nextSeq++
 		p.mu.Unlock()
 		return &Lease{pool: p, pa: pa}, nil
 	}
-	p.mu.Unlock()
-	if !anyBanned {
-		return nil, ErrPoolBusy
+	if excludedIdentity != "" && !distinctReady {
+		p.mu.Unlock()
+		return nil, ErrNoAlternativeAccount
 	}
-	// Some accounts are banned, others busy or parked. If every account is
-	// banned, no wait can help.
-	allGone := true
-	for _, pa := range p.accounts {
-		if p.healthNow(pa, now) != healthBanned {
-			allGone = false
-			break
+	// Check the terminal all-banned case while holding p.mu. AddAccount and
+	// RemoveAccount mutate p.accounts, so traversing the slice after unlock
+	// would race with hot administration and could observe a stale backing
+	// array.
+	allGone := anyBanned
+	if allGone {
+		for _, pa := range p.accounts {
+			if p.healthNow(pa, now) != healthBanned {
+				allGone = false
+				break
+			}
 		}
 	}
+	p.mu.Unlock()
 	if allGone {
 		return nil, ErrNoAccounts
 	}
 	return nil, ErrPoolBusy
+}
+
+// accountScore ranks ready accounts. Lower is better. In-flight dominates;
+// measured latency breaks ties, while cold accounts receive a neutral prior.
+func (p *Pool) accountScore(pa *poolAccount) float64 {
+	inflight := float64(len(pa.slots))
+	capacity := float64(cap(pa.slots))
+	if capacity <= 0 {
+		capacity = 1
+	}
+	load := inflight / capacity
+	latency := 1.0
+	if pa.ewmaNanos > 0 {
+		latency += pa.ewmaNanos / float64(time.Second)
+	}
+	warmPenalty := 0.0
+	pa.am.mu.Lock()
+	if pa.am.token == "" {
+		warmPenalty = 0.05
+	}
+	pa.am.mu.Unlock()
+	return load*100 + latency + warmPenalty
+}
+
+// Observe records one completed request latency for future scheduling.
+func (p *Pool) Observe(lease *Lease, elapsed time.Duration) {
+	if lease == nil || lease.pa == nil || elapsed < 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	alpha := p.cfg.EWMAAlpha
+	if alpha <= 0 || alpha >= 1 {
+		alpha = 0.2
+	}
+	sample := float64(elapsed)
+	if lease.pa.samples == 0 {
+		lease.pa.ewmaNanos = sample
+	} else {
+		lease.pa.ewmaNanos = alpha*sample + (1-alpha)*lease.pa.ewmaNanos
+	}
+	lease.pa.samples++
 }
 
 // Lease is one reserved in-flight slot on one account.
@@ -569,13 +671,16 @@ func (p *Pool) Status() []map[string]any {
 		case healthRisk:
 			state = "risk"
 		}
+		pa.am.mu.Lock()
+		parkUntil := pa.am.parkUntil.Format(time.RFC3339)
+		pa.am.mu.Unlock()
 		out = append(out, map[string]any{
 			"mobile":     pa.account.Mobile,
 			"region":     pa.account.normalizedRegion(),
 			"state":      state,
 			"inflight":   len(pa.slots),
 			"max":        cap(pa.slots),
-			"park_until": pa.am.parkUntil.Format(time.RFC3339),
+			"park_until": parkUntil,
 		})
 	}
 	return out

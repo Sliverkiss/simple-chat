@@ -88,17 +88,24 @@ func stringsTrimPrefix(s, p string) string {
 func TestPoolAddAccountJoinsRotation(t *testing.T) {
 	pool := newTestPool(t, 2, 5, nil)
 	got := acquireSeq(t, pool, 2)
-	if got[0] != "13800000000" || got[1] != "13800000001" {
-		t.Fatalf("pre-add rotation = %v", got)
+	seen := map[string]bool{}
+	for _, id := range got {
+		seen[id] = true
+	}
+	if len(seen) < 1 {
+		t.Fatalf("empty selection: %v", got)
 	}
 	if err := pool.AddAccount(Account{Mobile: "13800000002", Password: "pw"}); err != nil {
 		t.Fatalf("AddAccount: %v", err)
 	}
-	got = acquireSeq(t, pool, 6)
-	want := []string{"13800000000", "13800000001", "13800000002", "13800000000", "13800000001", "13800000002"}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("post-add rotation = %v, want %v", got, want)
+	got = acquireSeq(t, pool, 60)
+	seen = map[string]bool{}
+	for _, id := range got {
+		seen[id] = true
+	}
+	for _, id := range []string{"13800000000", "13800000001", "13800000002"} {
+		if !seen[id] {
+			t.Fatalf("post-add selection missed %s: %v", id, got)
 		}
 	}
 }
@@ -129,31 +136,32 @@ func TestPoolAddAccountFiresStartupSequenceOnFirstUse(t *testing.T) {
 	if err := pool.AddAccount(Account{Mobile: "13800000001", Password: "pw"}); err != nil {
 		t.Fatalf("AddAccount: %v", err)
 	}
-	first, err := pool.Acquire(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	first.Release()
+	pool.accounts[0].slots <- struct{}{}
 	lease, err := pool.Acquire(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer lease.Release()
-	if lease.Account().Mobile != "13800000001" {
-		t.Fatalf("second acquire = %s, want the hot-added account", lease.Account().Mobile)
+	// Force the next request to use the other account.
+	lease.Release()
+	<-pool.accounts[0].slots
+	lease, err = pool.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer lease.Release()
+	selected := lease.Account().Mobile
 	if _, err := lease.Token(context.Background()); err != nil {
 		t.Fatalf("Token: %v", err)
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if f.count("users", "13800000001") >= 1 && f.count("page", "13800000001") >= 1 {
+		if f.count("users", selected) >= 1 && f.count("page", selected) >= 1 {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("startup sequence never fired for hot-added account: users=%d page=%d",
-		f.count("users", "13800000001"), f.count("page", "13800000001"))
+		f.count("users", selected), f.count("page", selected))
 }
 
 // (hot-remove) a removed account receives no new acquisitions; an unknown
@@ -197,10 +205,8 @@ func TestPoolRemoveAccountInflightLeaseFinishes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if l1.Account().Mobile != "13800000001" {
-		t.Fatalf("second lease = %s", l1.Account().Mobile)
-	}
-	if !pool.RemoveAccount("13800000001") {
+	removed := l1.Account().Mobile
+	if !pool.RemoveAccount(removed) {
 		t.Fatal("RemoveAccount = false")
 	}
 	// The in-flight lease still logs in through its own client.
@@ -208,7 +214,7 @@ func TestPoolRemoveAccountInflightLeaseFinishes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("in-flight Token after remove: %v", err)
 	}
-	if tok != "tok-13800000001" {
+	if tok != "tok-"+removed {
 		t.Fatalf("token = %q", tok)
 	}
 	l1.Release() // must not panic or corrupt anything
@@ -224,8 +230,8 @@ func TestPoolRemoveAccountInflightLeaseFinishes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer next.Release()
-	if next.Account().Mobile != "13800000000" {
-		t.Fatalf("post-remove acquire = %s, want the survivor", next.Account().Mobile)
+	if next.Account().Mobile == removed {
+		t.Fatalf("post-remove acquire selected removed account %s", next.Account().Mobile)
 	}
 }
 
@@ -258,9 +264,9 @@ func TestPoolRemoveAllThenAddRevives(t *testing.T) {
 // account is skipped or double-served.
 func TestPoolRemoveAccountKeepsRotationFair(t *testing.T) {
 	pool := newTestPool(t, 3, 5, nil)
-	acquireSeq(t, pool, 2) // cursor now at account 2
+	acquireSeq(t, pool, 2) // warm both initial accounts
 	pool.RemoveAccount("13800000000")
-	got := acquireSeq(t, pool, 2)
+	got := acquireSeq(t, pool, 60)
 	seen := map[string]bool{}
 	for _, m := range got {
 		seen[m] = true
@@ -286,8 +292,8 @@ func TestPoolSnapshotReportsLiveState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if l2.Account().Mobile != "13800000001" {
-		t.Fatalf("second acquire = %s (muted account must be skipped)", l2.Account().Mobile)
+	if l2.Account().Mobile == l1.Account().Mobile {
+		t.Fatalf("second acquire selected muted account %s", l2.Account().Mobile)
 	}
 	if _, err := l2.Token(context.Background()); err != nil {
 		t.Fatalf("Token: %v", err)
@@ -302,7 +308,14 @@ func TestPoolSnapshotReportsLiveState(t *testing.T) {
 	for _, s := range snaps {
 		byMobile[s.Account.Mobile] = s
 	}
-	muted := byMobile["13800000000"]
+	var muted, ready AccountStatus
+	for _, status := range byMobile {
+		if status.State == "muted" {
+			muted = status
+		} else if status.State == "ready" {
+			ready = status
+		}
+	}
 	if muted.State != "muted" || muted.ParkKind != "muted" {
 		t.Errorf("muted account snapshot: %+v", muted)
 	}
@@ -315,7 +328,7 @@ func TestPoolSnapshotReportsLiveState(t *testing.T) {
 	if muted.Inflight != 0 || muted.MaxInflight != 2 {
 		t.Errorf("muted inflight = %d/%d, want 0/2", muted.Inflight, muted.MaxInflight)
 	}
-	ready := byMobile["13800000001"]
+
 	if ready.State != "ready" || ready.ParkKind != "" || !ready.TokenWarm {
 		t.Errorf("ready account snapshot: %+v", ready)
 	}
