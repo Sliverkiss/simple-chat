@@ -269,10 +269,9 @@ func TestAdminUploadDuplicateConflict(t *testing.T) {
 	}
 }
 
-// (hot-add) after an upload, the running pool round-robins to the new
-// account on the next completion — no restart — and its first use fires
-// the startup sequence (users/current + fetch_page), exactly like a
-// startup-loaded account.
+// (hot-add) after an upload, the new account can be selected without
+// restart, and its first use fires the startup sequence (users/current +
+// fetch_page), exactly like a startup-loaded account.
 func TestAdminUploadHotAddRotationAndStartup(t *testing.T) {
 	f := newAdminFixture(t)
 	srv, _, pool := newAdminTestServer(t, f.srv.URL, "")
@@ -281,19 +280,30 @@ func TestAdminUploadHotAddRotationAndStartup(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("upload status = %d, body = %s", code, body)
 	}
-	// Drive two logins through the pool: seed then hot-added.
+	// Exercise both accounts without requiring the scoring scheduler to
+	// round-robin. A retry may explicitly exclude the first identity.
 	seen := map[string]bool{}
-	for i := 0; i < 2; i++ {
-		lease, err := pool.Acquire(context.Background())
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := lease.Token(context.Background()); err != nil {
-			t.Fatalf("Token(%s): %v", lease.Account().Mobile, err)
-		}
-		seen[lease.Account().Mobile] = true
-		lease.Release()
+	first, err := pool.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
 	}
+	if _, err := first.Token(context.Background()); err != nil {
+		first.Release()
+		t.Fatalf("Token(%s): %v", first.Account().Mobile, err)
+	}
+	seen[first.Account().Mobile] = true
+	firstIdentity := first.Account().Identity()
+	first.Release()
+	second, _, err := pool.AcquireWithWaitExcluding(context.Background(), firstIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.Token(context.Background()); err != nil {
+		second.Release()
+		t.Fatalf("Token(%s): %v", second.Account().Mobile, err)
+	}
+	seen[second.Account().Mobile] = true
+	second.Release()
 	if !seen["13900000001"] {
 		t.Fatalf("hot-added account never selected: %v", seen)
 	}
