@@ -301,8 +301,8 @@ func TestPurgeShutdownDrainsCleanly(t *testing.T) {
 }
 
 // TestPurgeLoopFiresOnShortDelay: with an injected near-immediate next
-// purge, the background loop fires a purge without manual intervention,
-// and continues firing (the override is honored on every re-read).
+// purge, the background loop fires once without manual intervention.
+// The test override must not become a permanently overdue wake target.
 func TestPurgeLoopFiresOnShortDelay(t *testing.T) {
 	f := newCleanupFixture(t)
 	gw, ts := newCleanupServer(t, f.srv.URL, func(c *Config) {
@@ -319,12 +319,21 @@ func TestPurgeLoopFiresOnShortDelay(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		postOneChat(t, ts.URL)
 	}
-	// Force the loop's next wake into the immediate future.
-	gw.purge.overrideNextUnix.Store(time.Now().Add(50 * time.Millisecond).Unix())
+	// Hold a due target long enough to prove the loop does not repeatedly
+	// purge the same slot. Before the one-shot override is consumed, this
+	// fails at cleanup: Shutdown cannot drain a busy-spinning scheduler.
+	gw.purge.overrideNextUnix.Store(time.Now().Add(-time.Second).Unix())
 
 	eventually(t, 5*time.Second, "background purge to fire", func() bool {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		return f.deleteAll >= 1
 	})
+	time.Sleep(100 * time.Millisecond)
+	f.mu.Lock()
+	calls := f.deleteAll
+	f.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("one due override fired %d purges, want exactly 1", calls)
+	}
 }
