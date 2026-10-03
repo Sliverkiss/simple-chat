@@ -433,17 +433,27 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var previous chatRetry
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		if !s.runAttempt(ctx, w, req, prompt, images, attempt) {
+		if !s.runAttempt(ctx, w, req, prompt, images, attempt, &previous) {
 			return
 		}
 	}
 }
 
+// chatRetry carries only the previous lease identity and the pre-response
+// failure across attempts. It is request-local and never printed in logs.
+type chatRetry struct {
+	identity string
+	err error
+	allowSameAccount bool
+}
+
 // runAttempt executes one full attempt (lease → upload → session →
-// completion → delivery). It returns true when the caller should re-attempt
-// on a fresh account: only ever when nothing has been written to the client.
-func (s *Server) runAttempt(ctx context.Context, w http.ResponseWriter, req *openai.Request, prompt string, images []openai.Image, attempt int) bool {
+// completion → delivery). It returns true only before client output; retry
+// selection prefers a distinct identity and permits same-account fallback
+// solely for bounded, non-account-specific failures.
+func (s *Server) runAttempt(ctx context.Context, w http.ResponseWriter, req *openai.Request, prompt string, images []openai.Image, attempt int, previous *chatRetry) bool {
 	started := time.Now()
 	termination := "completed"
 	accountID := "unknown"
@@ -452,7 +462,23 @@ func (s *Server) runAttempt(ctx context.Context, w http.ResponseWriter, req *ope
 	defer func() {
 		s.logCompletionDiagnostic(accountID, started, queueWait, attempt, req.Stream, termination, usage)
 	}()
-	lease, waited, err := s.pool.AcquireWithWait(ctx)
+	var lease *upstream.Lease
+	var waited time.Duration
+	var err error
+	if attempt == 1 {
+		lease, waited, err = s.pool.AcquireWithWait(ctx)
+	} else {
+		lease, waited, err = s.pool.AcquireWithWaitExcluding(ctx, previous.identity)
+		if errors.Is(err, upstream.ErrNoAlternativeAccount) {
+			if previous.allowSameAccount {
+				lease, waited, err = s.pool.AcquireWithWait(ctx)
+			} else {
+				s.writeUpstreamError(w, previous.err)
+				termination = "no_alternative"
+				return false
+			}
+		}
+	}
 	queueWait = waited
 	if err != nil {
 		s.writePoolError(w, err)
@@ -461,6 +487,7 @@ func (s *Server) runAttempt(ctx context.Context, w http.ResponseWriter, req *ope
 	}
 	defer lease.Release()
 	accountID = redactAccountID(lease.Account().Identity())
+	previous.identity = lease.Account().Identity()
 
 	tok, err := lease.Token(ctx)
 	if err != nil {
@@ -502,6 +529,8 @@ func (s *Server) runAttempt(ctx context.Context, w http.ResponseWriter, req *ope
 		s.logger.Printf("completion call failed (attempt %d): %v", attempt, err)
 		termination = "completion_error"
 		if attempt < maxAttempts && ctx.Err() == nil && upstream.IsRetryable(err) {
+			previous.err = err
+			previous.allowSameAccount = true
 			termination = "retry"
 			return true
 		}
@@ -510,13 +539,13 @@ func (s *Server) runAttempt(ctx context.Context, w http.ResponseWriter, req *ope
 	}
 
 	if req.Stream {
-		retry := s.deliverStream(ctx, w, lease, tok, sessionID, stream, attempt, req.ThinkingEnabled, &usage, &termination)
+		retry := s.deliverStream(ctx, w, lease, tok, sessionID, stream, attempt, req.ThinkingEnabled, &usage, &termination, previous)
 		if retry {
 			termination = "retry"
 		}
 		return retry
 	}
-	retry := s.deliverNonStream(ctx, w, lease, tok, sessionID, stream, attempt, req.ThinkingEnabled, &usage, &termination)
+	retry := s.deliverNonStream(ctx, w, lease, tok, sessionID, stream, attempt, req.ThinkingEnabled, &usage, &termination, previous)
 	if retry {
 		termination = "retry"
 	}
@@ -576,10 +605,9 @@ func isClientRetryableStreamError(err error) bool {
 // deliverStream bridges the upstream SSE into OpenAI chunk frames. The SSE
 // headers are NOT written until the first delta frame is emitted, which is
 // exactly what makes "retry before the first client byte" real: a stream
-// that fails (parallel_chat_limit, transport cut) before any output returns
-// retry=true and the ladder resends on a fresh account. After the first byte
-// the delivery is final — retrying would duplicate data.
-func (s *Server) deliverStream(ctx context.Context, w http.ResponseWriter, lease *upstream.Lease, tok, sessionID string, stream io.ReadCloser, attempt int, thinkingEnabled bool, usage *sse.Usage, termination *string) bool {
+// that fails before any client byte may retry under the bounded policy.
+// Once a client-visible frame is written, retrying would duplicate data.
+func (s *Server) deliverStream(ctx context.Context, w http.ResponseWriter, lease *upstream.Lease, tok, sessionID string, stream io.ReadCloser, attempt int, thinkingEnabled bool, usage *sse.Usage, termination *string, previous *chatRetry) bool {
 	defer stream.Close()
 
 	flusher, _ := w.(http.Flusher)
@@ -605,18 +633,17 @@ func (s *Server) deliverStream(ctx context.Context, w http.ResponseWriter, lease
 	id := randomID() // one id for the whole completion (all chunks share it)
 	first := true
 	interp.SetOnDelta(func(d sse.Delta) {
-		commit()
 		role := ""
-		if first {
-			role = "assistant"
-			first = false
-		}
 		if d.Reasoning != "" {
 			if !thinkingEnabled {
 				// Client opted out: thinking was never requested. Suppress any
 				// stray THINK deltas rather than leak reasoning_content.
 				return
 			}
+			if first {
+				role, first = "assistant", false
+			}
+			commit()
 			// THINK fragment: deep-thinking delta, emitted before content
 			// deltas as the fragments arrive.
 			writeChunk(openai.NewReasoningStreamChunk(id, openai.ModelName, d.Reasoning, role))
@@ -625,6 +652,10 @@ func (s *Server) deliverStream(ctx context.Context, w http.ResponseWriter, lease
 		if d.Text == "" {
 			return
 		}
+		if first {
+			role, first = "assistant", false
+		}
+		commit()
 		writeChunk(openai.NewStreamChunk(id, openai.ModelName, d.Text, role))
 	})
 
@@ -652,6 +683,8 @@ func (s *Server) deliverStream(ctx context.Context, w http.ResponseWriter, lease
 				lease.NoteError(st.Err)
 				s.logger.Printf("stream failed before first client byte (attempt %d): %v", attempt, st.Err)
 				if attempt < maxAttempts && ctx.Err() == nil && isClientRetryableStreamError(st.Err) {
+					previous.err = st.Err
+					previous.allowSameAccount = false
 					return true
 				}
 				// Terminal pre-commit failure: the client connection is still
@@ -694,6 +727,15 @@ func (s *Server) deliverStream(ctx context.Context, w http.ResponseWriter, lease
 		*termination = "transport_error"
 		// either — say so instead of lying with finish_reason:"stop".
 		s.logger.Printf("stream transport error: %v", readErr)
+		if !committed {
+			if attempt < maxAttempts && ctx.Err() == nil && upstream.IsRetryable(readErr) {
+				previous.err = readErr
+				previous.allowSameAccount = true
+				return true
+			}
+			writeError(w, http.StatusBadGateway, "upstream stream terminated early", "upstream_error", "stream_error")
+			return false
+		}
 		writeChunk(openai.ErrorBody("upstream stream terminated early", "upstream_error", "stream_error"))
 	case st.Text == "" && st.Reasoning == "" && !committed && attempt < maxAttempts && ctx.Err() == nil:
 		// Empty-but-clean stream before any client byte: one re-run on a
@@ -702,6 +744,8 @@ func (s *Server) deliverStream(ctx context.Context, w http.ResponseWriter, lease
 		// stream committed (first frame out, including a suppressed THINK
 		// delta), an empty finish is delivered honestly, never retried.
 		s.logger.Printf("empty stream output before first byte (attempt %d), re-running", attempt)
+		previous.err = nil
+		previous.allowSameAccount = true
 		return true
 	default:
 		if first && st.Text != "" {
@@ -720,11 +764,10 @@ func (s *Server) deliverStream(ctx context.Context, w http.ResponseWriter, lease
 }
 
 // deliverNonStream consumes the whole upstream stream, then decides: a
-// retryable failure (parallel_chat_limit, transport cut) or an empty output
-// re-runs once on a fresh account; anything else is delivered or mapped to
-// an error response. Nothing is written to the client before the decision,
-// so non-stream requests are always retry-safe.
-func (s *Server) deliverNonStream(ctx context.Context, w http.ResponseWriter, lease *upstream.Lease, tok, sessionID string, stream io.ReadCloser, attempt int, thinkingEnabled bool, usage *sse.Usage, termination *string) bool {
+// retryable failure (parallel_chat_limit, transport cut) or empty output
+// runs once more under the retry policy; other failures are delivered or
+// mapped to errors. No client bytes are written before the decision.
+func (s *Server) deliverNonStream(ctx context.Context, w http.ResponseWriter, lease *upstream.Lease, tok, sessionID string, stream io.ReadCloser, attempt int, thinkingEnabled bool, usage *sse.Usage, termination *string, previous *chatRetry) bool {
 	defer stream.Close()
 
 	interp := sse.New()
@@ -758,6 +801,8 @@ func (s *Server) deliverNonStream(ctx context.Context, w http.ResponseWriter, le
 		lease.NoteError(st.Err)
 		s.logger.Printf("non-stream failed (attempt %d): %v", attempt, st.Err)
 		if attempt < maxAttempts && ctx.Err() == nil && isClientRetryableStreamError(st.Err) {
+			previous.err = st.Err
+			previous.allowSameAccount = false
 			s.logger.Printf("retry ladder: switching account for attempt %d", attempt+1)
 			return true
 		}
@@ -769,6 +814,8 @@ func (s *Server) deliverNonStream(ctx context.Context, w http.ResponseWriter, le
 		// successful (truncated) completion — retry instead.
 		s.logger.Printf("non-stream transport error (attempt %d): %v", attempt, readErr)
 		if attempt < maxAttempts && ctx.Err() == nil && upstream.IsRetryable(readErr) {
+			previous.err = readErr
+			previous.allowSameAccount = true
 			s.logger.Printf("retry ladder: switching account for attempt %d", attempt+1)
 			return true
 		}
@@ -780,6 +827,8 @@ func (s *Server) deliverNonStream(ctx context.Context, w http.ResponseWriter, le
 		// A reasoning-only completion (empty content, non-empty THINK) is a
 		// valid answer, not a blip.
 		s.logger.Printf("empty completion output (attempt %d), re-running", attempt)
+		previous.err = nil
+		previous.allowSameAccount = true
 		return true
 	}
 	reasoning := st.Reasoning
