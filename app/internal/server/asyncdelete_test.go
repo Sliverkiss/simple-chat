@@ -9,9 +9,9 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
-	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -297,8 +297,8 @@ func TestAsyncDeleterNoRetryOnUpstreamRejection(t *testing.T) {
 	if got := attempts.Load(); got != 1 {
 		t.Errorf("delete attempts = %d, want 1 (upstream rejections must not be retried)", got)
 	}
-	if out := buf.String(); !strings.Contains(out, "sess-b") {
-		t.Errorf("rejection must be logged with the session id, got: %s", out)
+	if out := buf.String(); !strings.Contains(out, "session delete rejected") || strings.Contains(out, "sess-b") || strings.Contains(out, "session gone") {
+		t.Errorf("rejection must log the phase without session id or upstream message, got: %s", out)
 	}
 	d.shutdown()
 }
@@ -362,10 +362,10 @@ func TestAsyncDeleterQueueFullDrops(t *testing.T) {
 		d.enqueue(deleteJob{client: client, token: "tok", sessionID: id})
 	}
 	eventually(t, 3*time.Second, "overflow drop warning", func() bool {
-		return strings.Contains(buf.String(), "sess-d")
+		return strings.Contains(buf.String(), "queue full")
 	})
-	if out := buf.String(); !strings.Contains(out, "full") {
-		t.Errorf("drop warning should say the queue was full, got: %s", out)
+	if out := buf.String(); strings.Contains(out, "sess-d") {
+		t.Errorf("drop warning leaked session id: %s", out)
 	}
 	close(release)
 	d.shutdown()
@@ -386,8 +386,8 @@ func TestAsyncDeleterEnqueueAfterShutdownDropped(t *testing.T) {
 	d := newAsyncDeleter(deleterConfig{}, log.New(buf, "", 0))
 	d.shutdown()
 	d.enqueue(deleteJob{client: newDeleterTestClient(srv.URL), token: "tok", sessionID: "sess-late"})
-	if out := buf.String(); !strings.Contains(out, "sess-late") {
-		t.Errorf("post-shutdown enqueue must be dropped with a warning, got: %s", out)
+	if out := buf.String(); !strings.Contains(out, "session delete dropped (shutting down)") || strings.Contains(out, "sess-late") {
+		t.Errorf("post-shutdown warning must not expose session id, got: %s", out)
 	}
 }
 

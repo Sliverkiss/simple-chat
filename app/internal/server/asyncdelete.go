@@ -7,6 +7,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -86,20 +87,20 @@ func newAsyncDeleter(cfg deleterConfig, logger *log.Logger) *asyncDeleter {
 }
 
 // enqueue offers a job without ever blocking the caller: a full queue (or a
-// shutdown deleter) drops the job with a warning naming the session id.
+// shutdown deleter) drops the job with a warning without exposing the session id.
 func (d *asyncDeleter) enqueue(job deleteJob) {
 	select {
 	case <-d.closed:
-		d.logger.Printf("warn: session delete dropped (shutting down): %s", job.sessionID)
+		d.logger.Printf("warn: session delete dropped (shutting down)")
 		return
 	default:
 	}
 	select {
 	case d.queue <- job:
 	case <-d.closed:
-		d.logger.Printf("warn: session delete dropped (shutting down): %s", job.sessionID)
+		d.logger.Printf("warn: session delete dropped (shutting down)")
 	default:
-		d.logger.Printf("warn: session delete queue full, dropping delete for %s", job.sessionID)
+		d.logger.Printf("warn: session delete queue full, dropping delete")
 	}
 }
 
@@ -126,21 +127,21 @@ func (d *asyncDeleter) worker() {
 
 // run executes one delete: per-attempt timeout, exactly one retry on a
 // transport error (upstream rejections — BizError — are not retried).
-// Failures log at warn with the session id; never panics.
+// Failures log at warn without session ids or raw upstream messages.
 func (d *asyncDeleter) run(job deleteJob) {
 	defer func() {
 		if r := recover(); r != nil {
-			d.logger.Printf("warn: session delete panic recovered for %s: %v", job.sessionID, r)
+			d.logger.Printf("warn: session delete panic recovered (type %T)", r)
 		}
 	}()
 	if err := d.attempt(job); err != nil {
 		if !isTransportError(err) {
-			d.logger.Printf("warn: session delete rejected for %s: %v", job.sessionID, err)
+			d.logger.Printf("warn: session delete rejected (%s)", deleteErrorClass(err))
 			return
 		}
 		// One retry on transport errors only.
 		if err := d.attempt(job); err != nil {
-			d.logger.Printf("warn: session delete failed for %s: %v", job.sessionID, err)
+			d.logger.Printf("warn: session delete failed (%s)", deleteErrorClass(err))
 		}
 	}
 }
@@ -158,6 +159,18 @@ func (d *asyncDeleter) attempt(job deleteJob) error {
 func isTransportError(err error) bool {
 	var be *upstream.BizError
 	return !errors.As(err, &be)
+}
+
+// deleteErrorClass deliberately excludes raw upstream error messages.
+func deleteErrorClass(err error) string {
+	var biz *upstream.BizError
+	if errors.As(err, &biz) {
+		return fmt.Sprintf("biz_code=%d", biz.BizCode)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	return "transport"
 }
 
 // shutdown stops intake, drains the queue (bounded wait), and returns.
@@ -179,8 +192,8 @@ func (d *asyncDeleter) shutdown() {
 	// going to run — say so instead of losing it silently.
 	for {
 		select {
-		case job := <-d.queue:
-			d.logger.Printf("warn: session delete abandoned after shutdown: %s", job.sessionID)
+		case <-d.queue:
+			d.logger.Printf("warn: session delete abandoned after shutdown")
 		default:
 			return
 		}
