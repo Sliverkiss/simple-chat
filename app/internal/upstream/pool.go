@@ -78,6 +78,9 @@ type PoolConfig struct {
 	RandomSeed int64
 	// EWMAAlpha controls latency adaptation. Zero uses 0.2.
 	EWMAAlpha float64
+	// ParallelLimitCooldown briefly suppresses an identity after an explicit
+	// per-account parallel generation limit (default 1s).
+	ParallelLimitCooldown time.Duration
 }
 
 // LoginRecord is one successful login, handed to PoolConfig.OnLoginPersist.
@@ -148,6 +151,9 @@ func (c *PoolConfig) fillDefaults() {
 	if c.RiskCooldown <= 0 {
 		c.RiskCooldown = 10 * time.Minute
 	}
+	if c.ParallelLimitCooldown <= 0 {
+		c.ParallelLimitCooldown = time.Second
+	}
 }
 
 // poolAccount is the runtime state of one account in the ring.
@@ -177,6 +183,7 @@ const (
 	healthBanned
 	healthMuted
 	healthRisk
+	healthCooling
 )
 
 // Pool is the account ring.
@@ -436,6 +443,9 @@ func (p *Pool) healthNow(pa *poolAccount, now time.Time) health {
 	if pa.am.ban != BanNone {
 		return health(pa.am.ban)
 	}
+	if now.Before(pa.am.cooldownUntil) {
+		return healthCooling
+	}
 	return healthReady
 }
 
@@ -649,6 +659,17 @@ func (l *Lease) NoteError(err error) {
 	if err == nil {
 		return
 	}
+	if limited, ok := err.(interface{ IsParallelLimit() bool }); ok && limited.IsParallelLimit() {
+		l.pool.mu.Lock()
+		l.pa.am.mu.Lock()
+		until := time.Now().Add(l.pool.cfg.ParallelLimitCooldown)
+		if until.After(l.pa.am.cooldownUntil) {
+			l.pa.am.cooldownUntil = until
+		}
+		l.pa.am.mu.Unlock()
+		l.pool.mu.Unlock()
+		return
+	}
 	if BanKind(err) == BanNone {
 		return
 	}
@@ -754,6 +775,8 @@ func (p *Pool) Status() []map[string]any {
 			state = "muted"
 		case healthRisk:
 			state = "risk"
+		case healthCooling:
+			state = "cooling"
 		}
 		pa.am.mu.Lock()
 		parkUntil := pa.am.parkUntil.Format(time.RFC3339)
@@ -810,6 +833,8 @@ func (p *Pool) Snapshot() []AccountStatus {
 			state = "muted"
 		case healthRisk:
 			state = "risk"
+		case healthCooling:
+			state = "cooling"
 		}
 		pa.am.mu.Lock()
 		status := AccountStatus{

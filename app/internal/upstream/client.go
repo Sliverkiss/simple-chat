@@ -1105,11 +1105,12 @@ func (c *Client) fileStatus(ctx context.Context, token, fileID string) (string, 
 type AccountManager struct {
 	client *Client
 
-	mu        sync.Mutex
-	token     string
-	ban       BanState
-	banMsg    string
-	parkUntil time.Time
+	mu            sync.Mutex
+	token         string
+	ban           BanState
+	banMsg        string
+	parkUntil     time.Time
+	cooldownUntil time.Time // transient per-identity parallel-limit throttle
 	// startupFired guards the one-shot app-launch sequence (users/current
 	// then fetch_page) that fires on the empty→token transition — once per
 	// process per account (apk-behavior.md §8 D2).
