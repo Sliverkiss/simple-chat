@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -45,18 +44,24 @@ func openAccountStore(ctx context.Context, host, token, accountsPath string, log
 // for log lines: a schemed connection string becomes "<scheme>://<host>",
 // a bare/https Upstash host becomes "rediss://<host>".
 func redisHost(host string) string {
-	if !strings.HasPrefix(host, "rediss://") && !strings.HasPrefix(host, "redis://") {
-		h := strings.TrimSpace(host)
-		if i := strings.Index(h, "://"); i >= 0 {
-			h = h[i+3:]
-		}
-		return "rediss://" + h
-	}
 	u, err := url.Parse(host)
-	if err != nil || u.Host == "" {
+	if err != nil {
 		return "unparsable-url"
 	}
-	return u.Scheme + "://" + u.Host
+	if u.Host == "" {
+		u, err = url.Parse("//" + host)
+		if err != nil {
+			return "unparsable-url"
+		}
+	}
+	if u.Hostname() == "" {
+		return "unparsable-url"
+	}
+	scheme := u.Scheme
+	if scheme == "" || scheme == "https" {
+		scheme = "rediss"
+	}
+	return scheme + "://" + u.Hostname()
 }
 
 func main() {
