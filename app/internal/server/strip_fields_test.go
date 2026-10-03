@@ -248,7 +248,9 @@ func TestChatCompletionsStrippedLogLineWithSystemMerge(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if logBuf.String() != "" {
-		t.Errorf("clean request must not log, got %q", logBuf.String())
+	if strings.Contains(logBuf.String(), "stripped unsupported request fields:") {
+		t.Errorf("clean request unexpectedly logged stripped fields: %q", logBuf.String())
 	}
+	// Completion diagnostics are emitted for every request by design; this
+	// assertion only pins the field-stripping warning, not the diagnostics line.
 }

@@ -36,7 +36,10 @@ type Config struct {
 	// (default 30s); exceeded → 429 + Retry-After.
 	QueueWait time.Duration
 	APIKey    string // optional static key; empty = auth disabled (open access)
-	Logger    *log.Logger
+	// RandomSeed is a test seam for deterministic account selection. Zero
+	// keeps production selection time-seeded.
+	RandomSeed int64
+	Logger     *log.Logger
 	// DeleteQueueSize bounds pending async session deletes (default 256).
 	DeleteQueueSize int
 	// DeleteWorkers is the async delete worker count (default 2).
@@ -130,11 +133,12 @@ func NewServer(cfg Config) (*Server, error) {
 		}
 	}
 	pool, err := upstream.NewPool(cfg.Accounts, upstream.PoolConfig{
-		BaseURL:         cfg.UpstreamBase,
-		MaxInflight:     cfg.MaxInflight,
-		QueueWait:       cfg.QueueWait,
-		OnParkPersist:   onParkPersist,
-		OnLoginPersist:  onLoginPersist,
+		BaseURL:        cfg.UpstreamBase,
+		MaxInflight:    cfg.MaxInflight,
+		QueueWait:      cfg.QueueWait,
+		OnParkPersist:  onParkPersist,
+		OnLoginPersist: onLoginPersist,
+		RandomSeed:     cfg.RandomSeed,
 		Logger: func(format string, args ...any) {
 			logger.Printf(format, args...)
 		},
@@ -204,7 +208,9 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
-// requireAPIKey enforces the optional static key. Empty key = open access.
+// requireAPIKey enforces the static key. Empty-key open access is retained for
+// in-process tests and explicit development mode, while main rejects it for
+// production startup.
 func (s *Server) requireAPIKey(next http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.apiKey != "" && !s.keyMatches(r) {
@@ -423,7 +429,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// fetch honors the request context and a 30s client timeout.
 	images, err := openai.ExtractImages(ctx, req.Messages)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "image_fetch_failed")
+		writeError(w, http.StatusBadRequest, "image fetch failed", "invalid_request_error", "image_fetch_failed")
 		return
 	}
 
@@ -438,19 +444,29 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 // completion → delivery). It returns true when the caller should re-attempt
 // on a fresh account: only ever when nothing has been written to the client.
 func (s *Server) runAttempt(ctx context.Context, w http.ResponseWriter, req *openai.Request, prompt string, images []openai.Image, attempt int) bool {
-	lease, err := s.pool.Acquire(ctx)
+	started := time.Now()
+	termination := "completed"
+	accountID := "unknown"
+	queueWait := time.Duration(0)
+	var usage sse.Usage
+	defer func() {
+		s.logCompletionDiagnostic(accountID, started, queueWait, attempt, req.Stream, termination, usage)
+	}()
+	lease, waited, err := s.pool.AcquireWithWait(ctx)
+	queueWait = waited
 	if err != nil {
-		// Pool-level failures are terminal: all busy / all banned — a retry
-		// cannot conjure capacity.
 		s.writePoolError(w, err)
+		termination = "pool_failure"
 		return false
 	}
 	defer lease.Release()
+	accountID = redactAccountID(lease.Account().Identity())
 
 	tok, err := lease.Token(ctx)
 	if err != nil {
 		lease.NoteError(err)
 		s.writeUpstreamError(w, err)
+		termination = "token_error"
 		return false
 	}
 
@@ -461,6 +477,7 @@ func (s *Server) runAttempt(ctx context.Context, w http.ResponseWriter, req *ope
 			s.logger.Printf("image upload failed: %v", err)
 			lease.NoteError(err)
 			writeError(w, http.StatusBadGateway, "image upload failed", "upstream_error", "upload_failed")
+			termination = "upload_error"
 			return false
 		}
 		refFileIDs = append(refFileIDs, fileID)
@@ -470,29 +487,22 @@ func (s *Server) runAttempt(ctx context.Context, w http.ResponseWriter, req *ope
 	if err != nil {
 		lease.NoteError(err)
 		s.writeUpstreamError(w, err)
+		termination = "session_error"
 		return false
 	}
-
-	// App-like lifecycle (apk-behavior.md §8 D1): the session persists — the
-	// app keeps sessions whose exchange failed, too. The registry evicts
-	// oldest-beyond-cap only when a cap is configured, via the async deleter.
 	s.sessions.record(lease.Account().Mobile, sessionID, lease.Client(), tok)
 
 	stream, err := lease.Completion(ctx, upstream.CompletionRequest{
-		SessionID:        sessionID,
-		Prompt:           prompt,
-		RefFileIDs:       refFileIDs,
-		ThinkingDisabled: !req.ThinkingEnabled,
-		SearchEnabled:    req.SearchEnabled,
-		Temperature:      req.Temperature,
-		TopP:             req.TopP,
-		MaxTokens:        req.MaxTokens,
+		SessionID: sessionID, Prompt: prompt, RefFileIDs: refFileIDs,
+		ThinkingDisabled: !req.ThinkingEnabled, SearchEnabled: req.SearchEnabled,
+		Temperature: req.Temperature, TopP: req.TopP, MaxTokens: req.MaxTokens,
 	})
 	if err != nil {
 		lease.NoteError(err)
 		s.logger.Printf("completion call failed (attempt %d): %v", attempt, err)
+		termination = "completion_error"
 		if attempt < maxAttempts && ctx.Err() == nil && upstream.IsRetryable(err) {
-			s.logger.Printf("retry ladder: switching account for attempt %d", attempt+1)
+			termination = "retry"
 			return true
 		}
 		s.writeUpstreamError(w, err)
@@ -500,9 +510,54 @@ func (s *Server) runAttempt(ctx context.Context, w http.ResponseWriter, req *ope
 	}
 
 	if req.Stream {
-		return s.deliverStream(ctx, w, lease, tok, sessionID, stream, attempt, req.ThinkingEnabled)
+		retry := s.deliverStream(ctx, w, lease, tok, sessionID, stream, attempt, req.ThinkingEnabled, &usage, &termination)
+		if retry {
+			termination = "retry"
+		}
+		return retry
 	}
-	return s.deliverNonStream(ctx, w, lease, tok, sessionID, stream, attempt, req.ThinkingEnabled)
+	retry := s.deliverNonStream(ctx, w, lease, tok, sessionID, stream, attempt, req.ThinkingEnabled, &usage, &termination)
+	if retry {
+		termination = "retry"
+	}
+	return retry
+}
+
+func redactAccountID(identity string) string {
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		return "unknown"
+	}
+	if len(identity) <= 4 {
+		return "***"
+	}
+	return identity[:2] + "***" + identity[len(identity)-2:]
+}
+
+func (s *Server) logCompletionDiagnostic(accountID string, started time.Time, queueWait time.Duration, attempt int, stream bool, termination string, usage sse.Usage) {
+	elapsed := time.Since(started)
+	fields := map[string]any{
+		"event": "chat_completion", "account_id": accountID,
+		"input_tokens": tokenValue(usage.PromptTokens), "output_tokens": tokenValue(usage.CompletionTokens), "total_tokens": tokenValue(usage.TotalTokens),
+		"elapsed_ms": elapsed.Milliseconds(), "tok_per_sec": tokPerSecond(usage.CompletionTokens, elapsed), "queue_wait_ms": queueWait.Milliseconds(),
+		"attempt": attempt, "stream": stream, "termination": termination,
+	}
+	b, _ := json.Marshal(fields)
+	s.logger.Printf("%s", b)
+}
+
+func tokenValue(n int) any {
+	if n <= 0 {
+		return "unknown"
+	}
+	return n
+}
+
+func tokPerSecond(tokens int, elapsed time.Duration) any {
+	if tokens <= 0 || elapsed <= 0 {
+		return "unknown"
+	}
+	return float64(tokens) / elapsed.Seconds()
 }
 
 // isClientRetryableStreamError reports whether a mid-stream error that
@@ -524,7 +579,7 @@ func isClientRetryableStreamError(err error) bool {
 // that fails (parallel_chat_limit, transport cut) before any output returns
 // retry=true and the ladder resends on a fresh account. After the first byte
 // the delivery is final — retrying would duplicate data.
-func (s *Server) deliverStream(ctx context.Context, w http.ResponseWriter, lease *upstream.Lease, tok, sessionID string, stream io.ReadCloser, attempt int, thinkingEnabled bool) bool {
+func (s *Server) deliverStream(ctx context.Context, w http.ResponseWriter, lease *upstream.Lease, tok, sessionID string, stream io.ReadCloser, attempt int, thinkingEnabled bool, usage *sse.Usage, termination *string) bool {
 	defer stream.Close()
 
 	flusher, _ := w.(http.Flusher)
@@ -589,6 +644,11 @@ func (s *Server) deliverStream(ctx context.Context, w http.ResponseWriter, lease
 		if st.Err != nil {
 			if !committed {
 				// Nothing written to the client yet — the ladder may retry.
+				if errors.Is(st.Err, sse.ErrContentFilter) {
+					*termination = "content_filter"
+				} else {
+					*termination = "stream_error"
+				}
 				lease.NoteError(st.Err)
 				s.logger.Printf("stream failed before first client byte (attempt %d): %v", attempt, st.Err)
 				if attempt < maxAttempts && ctx.Err() == nil && isClientRetryableStreamError(st.Err) {
@@ -617,9 +677,10 @@ func (s *Server) deliverStream(ctx context.Context, w http.ResponseWriter, lease
 		}
 	}
 	st := interp.Snapshot()
+	*usage = st.Usage
 	switch {
 	case st.Err != nil:
-		// A clean final chunk here would tell standard OpenAI clients the
+		*termination = "stream_error"
 		// completion finished normally — silently truncated output that looks
 		// right (gap-analysis R2). The error frame already went out; the only
 		// acceptable extra is a final chunk carrying the upstream's own
@@ -630,7 +691,7 @@ func (s *Server) deliverStream(ctx context.Context, w http.ResponseWriter, lease
 			writeChunk(openai.NewFinalChunk(id, openai.ModelName, st.Usage.TotalTokens, se.FinishReason, st.SearchResults))
 		}
 	case readErr != nil:
-		// Transport cut mid-stream after the first byte: not a clean finish
+		*termination = "transport_error"
 		// either — say so instead of lying with finish_reason:"stop".
 		s.logger.Printf("stream transport error: %v", readErr)
 		writeChunk(openai.ErrorBody("upstream stream terminated early", "upstream_error", "stream_error"))
@@ -663,7 +724,7 @@ func (s *Server) deliverStream(ctx context.Context, w http.ResponseWriter, lease
 // re-runs once on a fresh account; anything else is delivered or mapped to
 // an error response. Nothing is written to the client before the decision,
 // so non-stream requests are always retry-safe.
-func (s *Server) deliverNonStream(ctx context.Context, w http.ResponseWriter, lease *upstream.Lease, tok, sessionID string, stream io.ReadCloser, attempt int, thinkingEnabled bool) bool {
+func (s *Server) deliverNonStream(ctx context.Context, w http.ResponseWriter, lease *upstream.Lease, tok, sessionID string, stream io.ReadCloser, attempt int, thinkingEnabled bool, usage *sse.Usage, termination *string) bool {
 	defer stream.Close()
 
 	interp := sse.New()
@@ -690,8 +751,10 @@ func (s *Server) deliverNonStream(ctx context.Context, w http.ResponseWriter, le
 		}
 	}
 	st := interp.Snapshot()
+	*usage = st.Usage
 	switch {
 	case st.Err != nil:
+		*termination = "stream_error"
 		lease.NoteError(st.Err)
 		s.logger.Printf("non-stream failed (attempt %d): %v", attempt, st.Err)
 		if attempt < maxAttempts && ctx.Err() == nil && isClientRetryableStreamError(st.Err) {
@@ -701,6 +764,7 @@ func (s *Server) deliverNonStream(ctx context.Context, w http.ResponseWriter, le
 		s.writeUpstreamError(w, st.Err)
 		return false
 	case readErr != nil:
+		*termination = "transport_error"
 		// Transport cut mid-stream: partial output would look like a
 		// successful (truncated) completion — retry instead.
 		s.logger.Printf("non-stream transport error (attempt %d): %v", attempt, readErr)
