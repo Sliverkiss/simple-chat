@@ -451,8 +451,8 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 // chatRetry carries only the previous lease identity and the pre-response
 // failure across attempts. It is request-local and never printed in logs.
 type chatRetry struct {
-	identity string
-	err error
+	identity         string
+	err              error
 	allowSameAccount bool
 }
 
@@ -478,6 +478,11 @@ func (s *Server) runAttempt(ctx context.Context, w http.ResponseWriter, req *ope
 		lease, waited, err = s.pool.AcquireWithWaitExcluding(ctx, previous.identity)
 		if errors.Is(err, upstream.ErrNoAlternativeAccount) {
 			if previous.allowSameAccount {
+				if noReadyAccounts(s.pool) {
+					writeError(w, http.StatusServiceUnavailable, "no eligible account available for retry", "upstream_error", "no_eligible_account")
+					termination = "no_eligible_account"
+					return false
+				}
 				lease, waited, err = s.pool.AcquireWithWait(ctx)
 			} else {
 				s.writeUpstreamError(w, previous.err)
@@ -488,6 +493,14 @@ func (s *Server) runAttempt(ctx context.Context, w http.ResponseWriter, req *ope
 	}
 	queueWait = waited
 	if err != nil {
+		// A safe same-account retry cannot proceed if its account was
+		// removed or parked in the meantime. Distinguish this from a
+		// capacity-bound ready account (which remains pool_busy/429).
+		if attempt > 1 && previous.allowSameAccount && noReadyAccounts(s.pool) {
+			writeError(w, http.StatusServiceUnavailable, "no eligible account available for retry", "upstream_error", "no_eligible_account")
+			termination = "no_eligible_account"
+			return false
+		}
 		s.writePoolError(w, err)
 		termination = "pool_failure"
 		return false
@@ -538,7 +551,6 @@ func (s *Server) runAttempt(ctx context.Context, w http.ResponseWriter, req *ope
 		if attempt < maxAttempts && ctx.Err() == nil && upstream.IsRetryable(err) {
 			previous.err = err
 			previous.allowSameAccount = true
-			termination = "retry"
 			return true
 		}
 		s.writeUpstreamError(w, err)
@@ -546,17 +558,21 @@ func (s *Server) runAttempt(ctx context.Context, w http.ResponseWriter, req *ope
 	}
 
 	if req.Stream {
-		retry := s.deliverStream(ctx, w, lease, tok, sessionID, stream, attempt, req.ThinkingEnabled, &usage, &termination, previous)
-		if retry {
-			termination = "retry"
+		return s.deliverStream(ctx, w, lease, tok, sessionID, stream, attempt, req.ThinkingEnabled, &usage, &termination, previous)
+	}
+	return s.deliverNonStream(ctx, w, lease, tok, sessionID, stream, attempt, req.ThinkingEnabled, &usage, &termination, previous)
+}
+
+// noReadyAccounts checks the pool's health snapshot rather than treating a
+// transiently full slot as a missing account. Snapshot synchronizes with hot
+// removal and park transitions.
+func noReadyAccounts(pool *upstream.Pool) bool {
+	for _, account := range pool.Snapshot() {
+		if account.State == "ready" {
+			return false
 		}
-		return retry
 	}
-	retry := s.deliverNonStream(ctx, w, lease, tok, sessionID, stream, attempt, req.ThinkingEnabled, &usage, &termination, previous)
-	if retry {
-		termination = "retry"
-	}
-	return retry
+	return true
 }
 
 func redactAccountID(identity string) string {
@@ -753,6 +769,7 @@ func (s *Server) deliverStream(ctx context.Context, w http.ResponseWriter, lease
 		// stream committed (first frame out, including a suppressed THINK
 		// delta), an empty finish is delivered honestly, never retried.
 		s.logger.Printf("empty stream output before first byte (attempt %d), re-running", attempt)
+		*termination = "empty_output"
 		previous.err = nil
 		previous.allowSameAccount = true
 		return true
@@ -838,6 +855,7 @@ func (s *Server) deliverNonStream(ctx context.Context, w http.ResponseWriter, le
 		// A reasoning-only completion (empty content, non-empty THINK) is a
 		// valid answer, not a blip.
 		s.logger.Printf("empty completion output (attempt %d), re-running", attempt)
+		*termination = "empty_output"
 		previous.err = nil
 		previous.allowSameAccount = true
 		return true
