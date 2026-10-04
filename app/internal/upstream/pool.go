@@ -53,8 +53,8 @@ type PoolConfig struct {
 	// is busy (default 30s).
 	QueueWait time.Duration
 	// MuteParkDefault parks a muted account when the upstream sends no
-	// mute_until (default 6h; recon: mutes are "usually weeks" — this is a
-	// conservative floor, not a guess at their duration).
+	// mute_until (default 7 days; missing/invalid/past timestamps must not
+	// cause an early retry). Explicit overrides are useful for local tests.
 	MuteParkDefault time.Duration
 	// RiskCooldown parks a risk-device account (default 10min).
 	RiskCooldown time.Duration
@@ -146,7 +146,7 @@ func (c *PoolConfig) fillDefaults() {
 		c.QueueWait = 30 * time.Second
 	}
 	if c.MuteParkDefault <= 0 {
-		c.MuteParkDefault = 6 * time.Hour
+		c.MuteParkDefault = 7 * 24 * time.Hour
 	}
 	if c.RiskCooldown <= 0 {
 		c.RiskCooldown = 10 * time.Minute
@@ -173,6 +173,9 @@ type poolAccount struct {
 	// no latency sample yet.
 	ewmaNanos float64
 	samples   uint64
+	// Written only under p.mu; tracks the first NoteError persistence after
+	// AccountManager.markBan sets a mute deadline without persisting it.
+	parkReported time.Time
 }
 
 // health states for an account.
@@ -695,17 +698,28 @@ func (l *Lease) NoteError(err error) {
 		if be != nil {
 			until = be.MuteUntil
 		}
-		if until.IsZero() || until.Before(time.Now()) {
-			until = time.Now().Add(l.pool.cfg.MuteParkDefault)
+		// The manager may have parked this same biz5 before NoteError sees it.
+		// A fallback is relative to observation time, so recomputing it here
+		// would extend the deadline on every duplicate report.
+		if l.pa.am.ban == BanMuted && (be == nil || !be.MuteUntil.After(time.Now())) && l.pa.am.parkUntil.After(time.Now()) {
+			until = l.pa.am.parkUntil
+		} else {
+			until = localMuteDeadline(until, l.pool.cfg.MuteParkDefault)
 		}
 		// Concurrent leases may report older/shorter mute windows out of
 		// order. Never make a known mute eligible sooner.
 		if l.pa.am.ban == BanMuted && l.pa.am.parkUntil.After(until) {
 			return
 		}
+		// Equal windows can still need their first durable write: markBan runs
+		// before NoteError on the same error. Suppress only later duplicates.
+		if l.pa.am.ban == BanMuted && l.pa.am.parkUntil.Equal(until) && l.pa.parkReported.Equal(until) {
+			return
+		}
 		l.pa.am.ban = BanMuted
 		l.pa.am.parkUntil = until
 		l.pa.am.banMsg = "account muted: " + err.Error()
+		l.pa.parkReported = until
 	case BanRiskDevice:
 		l.pa.am.ban = BanRiskDevice
 		l.pa.am.parkUntil = time.Now().Add(l.pool.cfg.RiskCooldown)

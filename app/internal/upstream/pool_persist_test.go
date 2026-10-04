@@ -110,8 +110,8 @@ func TestNoteErrorMutePersistsViaSink(t *testing.T) {
 	if got.Mobile != "13800000000" || got.Kind != BanMuted {
 		t.Errorf("record = {%s %d}, want {13800000000 muted}", got.Mobile, got.Kind)
 	}
-	if !got.Until.Equal(until) {
-		t.Errorf("until = %v, want %v", got.Until, until)
+	if !got.Until.Equal(until.Add(time.Hour)) {
+		t.Errorf("until = %v, want %v", got.Until, until.Add(time.Hour))
 	}
 	if !strings.Contains(got.Reason, "muted") {
 		t.Errorf("reason = %q, want it to carry the upstream message", got.Reason)
@@ -258,6 +258,13 @@ func TestNaturalUnparkClearsPersistedFields(t *testing.T) {
 	if !rec.contains(BanMuted) {
 		t.Fatal("park was not persisted")
 	}
+	// Move the local deadline past for a deterministic natural-unpark check;
+	// a real upstream deadline gets an additional hour of grace.
+	pool.mu.Lock()
+	pool.accounts[0].am.mu.Lock()
+	pool.accounts[0].am.parkUntil = time.Now().Add(-time.Second)
+	pool.accounts[0].am.mu.Unlock()
+	pool.mu.Unlock()
 	// Wait for the natural unpark: acquire succeeds again.
 	deadline := time.Now().Add(2 * time.Second)
 	for {
@@ -286,10 +293,11 @@ func TestConcurrentParkTransitionsThroughSink(t *testing.T) {
 		{Mobile: "102", Password: "pw"},
 	}
 	pool, err := NewPool(accounts, PoolConfig{
-		BaseURL:       f.srv.URL,
-		MaxInflight:   4,
-		QueueWait:     10 * time.Millisecond,
-		OnParkPersist: rec.sink,
+		BaseURL:         f.srv.URL,
+		MaxInflight:     4,
+		QueueWait:       10 * time.Millisecond,
+		MuteParkDefault: 45 * time.Millisecond,
+		OnParkPersist:   rec.sink,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -307,9 +315,10 @@ func TestConcurrentParkTransitionsThroughSink(t *testing.T) {
 				// Short windows: parks expire quickly, driving concurrent
 				// unpark clears in other goroutines' acquire passes.
 				lease.NoteError(&BizError{
-					BizCode:   5,
-					BizMsg:    "user is muted",
-					MuteUntil: time.Now().Add(time.Duration(20+g*5) * time.Millisecond),
+					BizCode: 5,
+					BizMsg:  "user is muted",
+					// Invalid deadline uses the explicitly short test cooldown.
+					MuteUntil: time.Time{},
 				})
 				lease.Release()
 			}

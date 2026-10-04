@@ -981,18 +981,15 @@ func (s *Server) writeUpstreamError(w http.ResponseWriter, err error) {
 	writeError(w, status, message, typ, code)
 }
 
-// mutedRetryAfterFallback bounds Retry-After for a muted account when the
-// upstream sends no usable mute_until: conservative minutes, not hours.
-const mutedRetryAfterFallback = 60
-
-// setMuteRetryAfter derives the 429 Retry-After header from the upstream
-// mute_until (already parsed for parking). A missing, past, or absurd
-// (longer than a day) window falls back to a conservative constant.
+// setMuteRetryAfter derives the 429 Retry-After header from the same local
+// policy as account parking. The upstream timestamp itself is not the local
+// eligibility deadline.
 func (s *Server) setMuteRetryAfter(w http.ResponseWriter, be *upstream.BizError) {
 	until := be.MuteUntil
-	if until.IsZero() || until.Before(time.Now()) || time.Until(until) > 24*time.Hour {
-		w.Header().Set("Retry-After", strconv.Itoa(mutedRetryAfterFallback))
-		return
+	if !until.After(time.Now()) {
+		until = time.Now().Add(7 * 24 * time.Hour)
+	} else {
+		until = until.Add(time.Hour)
 	}
 	w.Header().Set("Retry-After", strconv.Itoa(int(time.Until(until).Round(time.Second)/time.Second)))
 }

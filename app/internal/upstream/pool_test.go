@@ -242,7 +242,17 @@ func TestPoolMutedParksUntilMuteUntil(t *testing.T) {
 	if _, err := pool.Acquire(context.Background()); !errors.Is(err, ErrPoolBusy) {
 		t.Fatalf("want ErrPoolBusy while muted, got %v", err)
 	}
-	// After mute_until passes the account rejoins rotation.
+	// The upstream deadline itself is insufficient: local grace remains.
+	time.Sleep(130 * time.Millisecond)
+	if _, err := pool.Acquire(context.Background()); !errors.Is(err, ErrPoolBusy) {
+		t.Fatalf("account returned before local grace expired: %v", err)
+	}
+	pool.mu.Lock()
+	pool.accounts[0].am.mu.Lock()
+	pool.accounts[0].am.parkUntil = time.Now().Add(-time.Second)
+	pool.accounts[0].am.mu.Unlock()
+	pool.mu.Unlock()
+	// Simulate the local deadline passing without waiting an hour.
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		l2, err := pool.Acquire(context.Background())

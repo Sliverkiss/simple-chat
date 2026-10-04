@@ -1200,6 +1200,16 @@ func (am *AccountManager) fireStartupSequence(tok string) {
 }
 
 // markBan records ban/mute states from an upstream error.
+// localMuteDeadline applies the grace exactly once to the raw upstream error.
+// Persisted deadlines and account-manager deadlines are already local; callers
+// must never pass either back into this function as a new upstream timestamp.
+func localMuteDeadline(until time.Time, fallback time.Duration) time.Time {
+	if until.After(time.Now()) {
+		return until.Add(time.Hour)
+	}
+	return time.Now().Add(fallback)
+}
+
 func (am *AccountManager) markBan(err error) {
 	if am.ban == BanBanned {
 		return
@@ -1215,13 +1225,14 @@ func (am *AccountManager) markBan(err error) {
 		if be != nil {
 			until = be.MuteUntil
 		}
-		if until.IsZero() || until.Before(time.Now()) {
-			duration := am.muteParkDefault
-			if duration <= 0 {
-				duration = 6 * time.Hour
-			}
-			until = time.Now().Add(duration)
+		if am.ban == BanMuted && (be == nil || !be.MuteUntil.After(time.Now())) && am.parkUntil.After(time.Now()) {
+			return // duplicate fallback report must not slide the local deadline
 		}
+		duration := am.muteParkDefault
+		if duration <= 0 {
+			duration = 7 * 24 * time.Hour
+		}
+		until = localMuteDeadline(until, duration)
 		if am.ban == BanMuted && am.parkUntil.After(until) {
 			return
 		}
