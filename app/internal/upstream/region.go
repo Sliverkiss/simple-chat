@@ -106,9 +106,6 @@ type Account struct {
 	// on boot (the wire exposes no expiry) — the lazy-relogin-on-auth-failure
 	// path handles staleness naturally.
 	SessionToken string `json:"session_token,omitempty"`
-	// StoreEpoch fences stale callbacks from another process or an older
-	// incarnation of the same identity. It is never sent upstream.
-	StoreEpoch string `json:"store_epoch,omitempty"`
 }
 
 // deviceIDNamespace is the fixed UUIDv5 namespace for account device ids.

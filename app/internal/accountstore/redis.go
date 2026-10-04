@@ -177,12 +177,11 @@ func (s *RedisStore) Load(ctx context.Context) ([]upstream.Account, error) {
 			s.logf("redis store: skipping unparseable account key")
 			continue
 		}
-		original := acct
 		if parkExpired(acct, time.Now()) {
 			acct.ParkKind, acct.ParkUntil = "", ""
 			acct.ParkReason, acct.ParkedAt = "", ""
-			if err := s.PatchPark(ctx, original, acct); err != nil {
-				return nil, fmt.Errorf("redis store: cannot clear expired park: %w", err)
+			if err := s.SaveAccount(ctx, acct); err != nil {
+				s.logf("redis store: cannot clear expired park (store error)")
 			}
 		}
 		accounts = append(accounts, acct)
@@ -228,44 +227,6 @@ func (s *RedisStore) SaveAccount(ctx context.Context, acct upstream.Account) err
 // data key. ErrAccountNotFound when the identity is not in the index — the
 // admin API maps that to 404. The removal is plain Redis deletion: no
 // upstream logout, no token invalidation.
-// patchAccount atomically updates only requested fields on an existing
-// incarnation. Deleted/re-added identities reject stale callbacks.
-const redisPatchScript = `-- simple-chat-patch-v1
-local raw = redis.call('GET', KEYS[1])
-if not raw then return 0 end
-local acct = cjson.decode(raw)
-if (acct.store_epoch or '') ~= ARGV[1] then return 0 end
-if ARGV[2] == 'park' then
-  if (acct.park_kind or '') ~= ARGV[3] or (acct.park_until or '') ~= ARGV[4] or (acct.park_reason or '') ~= ARGV[5] or (acct.parked_at or '') ~= ARGV[6] then return 0 end
-  acct.park_kind = ARGV[7] ~= '' and ARGV[7] or nil
-  acct.park_until = ARGV[8] ~= '' and ARGV[8] or nil
-  acct.park_reason = ARGV[9] ~= '' and ARGV[9] or nil
-  acct.parked_at = ARGV[10] ~= '' and ARGV[10] or nil
-else
-  acct.session_token = ARGV[7] ~= '' and ARGV[7] or nil
-end
-redis.call('SET', KEYS[1], cjson.encode(acct))
-return 1`
-
-func (s *RedisStore) PatchPark(ctx context.Context, before, after upstream.Account) error {
-	reply, err := s.conn.do("EVAL", redisPatchScript, "1", redisKeyPrefix+after.Identity(), after.StoreEpoch,
-		"park", before.ParkKind, before.ParkUntil, before.ParkReason, before.ParkedAt,
-		after.ParkKind, after.ParkUntil, after.ParkReason, after.ParkedAt)
-	if err == nil && reply != int64(1) {
-		return errors.New("redis store: park patch rejected (missing account, replaced incarnation or changed park)")
-	}
-	return err
-}
-
-func (s *RedisStore) PatchLogin(ctx context.Context, acct upstream.Account) error {
-	reply, err := s.conn.do("EVAL", redisPatchScript, "1", redisKeyPrefix+acct.Identity(), acct.StoreEpoch,
-		"login", "", "", "", "", acct.SessionToken, "", "", "")
-	if err == nil && reply != int64(1) {
-		return errors.New("redis store: login patch rejected (missing account or replaced incarnation)")
-	}
-	return err
-}
-
 func (s *RedisStore) DeleteAccount(ctx context.Context, identity string) error {
 	// The index stores the account's identity (mobile, else email).
 	reply, err := s.conn.do("SREM", redisIndexKey, identity)

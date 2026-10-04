@@ -14,9 +14,6 @@ package accountstore
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
-	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -28,8 +25,8 @@ import (
 // changes through to the backing store. Backing reads happen only at
 // construction; backing writes happen only at the write-through moments.
 // Fail-soft writes (ApplyPark/ApplyLogin) log and leave the in-memory state
-// correct. Redis uses fenced, field-only patches; a failed Redis write is
-// not assumed to heal on a later transition. Hard writes propagate errors with the
+// correct — the next transition re-writes the full record, healing a missed
+// write. Hard writes (SaveAccount/DeleteAccount) propagate errors with the
 // cache untouched, so the admin API can answer 5xx honestly.
 type MemoryFirstStore struct {
 	backing Store
@@ -114,15 +111,6 @@ func (s *MemoryFirstStore) Load(ctx context.Context) ([]upstream.Account, error)
 func (s *MemoryFirstStore) SaveAccount(ctx context.Context, acct upstream.Account) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.backing.(interface {
-		PatchPark(context.Context, upstream.Account, upstream.Account) error
-	}); ok {
-		var epoch [16]byte
-		if _, err := rand.Read(epoch[:]); err != nil {
-			return fmt.Errorf("store epoch: %w", err)
-		}
-		acct.StoreEpoch = hex.EncodeToString(epoch[:])
-	}
 	if err := s.backing.SaveAccount(ctx, acct); err != nil {
 		return err
 	}
@@ -158,20 +146,12 @@ func (s *MemoryFirstStore) ApplyPark(rec upstream.ParkRecord) {
 		logf(s.logger, "memory-first store: park for unknown or stale identity skipped")
 		return
 	}
-	previous := acct
 	if !applyParkRecord(&acct, rec, time.Now()) {
 		s.mu.Unlock()
 		return // already persisted exactly this state
 	}
 	s.accounts[rec.Mobile] = acct
-	var err error
-	if patch, ok := s.backing.(interface {
-		PatchPark(context.Context, upstream.Account, upstream.Account) error
-	}); ok {
-		err = patch.PatchPark(context.Background(), previous, acct)
-	} else {
-		err = s.backing.SaveAccount(context.Background(), acct)
-	}
+	err := s.backing.SaveAccount(context.Background(), acct)
 	s.mu.Unlock()
 	if err != nil {
 		logf(s.logger, "memory-first store: cannot persist park state (store error)")
@@ -192,14 +172,7 @@ func (s *MemoryFirstStore) ApplyLogin(rec upstream.LoginRecord) {
 	}
 	acct.SessionToken = rec.Token
 	s.accounts[rec.Identity] = acct
-	var err error
-	if patch, ok := s.backing.(interface {
-		PatchLogin(context.Context, upstream.Account) error
-	}); ok {
-		err = patch.PatchLogin(context.Background(), acct)
-	} else {
-		err = s.backing.SaveAccount(context.Background(), acct)
-	}
+	err := s.backing.SaveAccount(context.Background(), acct)
 	s.mu.Unlock()
 	if err != nil {
 		logf(s.logger, "memory-first store: cannot persist session token (store error)")
