@@ -44,6 +44,13 @@
 - 同一错误可能先由 `AccountManager.markBan` 再由 `Lease.NoteError` 处理；两入口不得重复加成，同一截止重复上报也不得延长一小时。并发迟到的更短截止不得缩短已知期限；持久回调不能将较长期限写回为短期。
 - 验收：httptest 的 HTTP 200／非 200 登录、会话、completion biz5；实际 SSE biz5 仅在当前解析器会把它分类成 biz5 时同样执行；解析秒数／字符串／RFC3339 和无效／已过期兜底；并发迟到、持久化重启跳过和到期复选。仅虚构身份、本地 store，不连真实 Redis／上游。
 
+## 永久 ban 写入与迟到 risk 单调期限（独立验收）
+
+- AC-P11：上游 biz 10 在登录／建会话／completion 经 `AccountManager.markBan` 预先置永久 ban 后，lease 的 `NoteError` 必须恰好一次写入 `OnParkPersist`；再次通知不得重复。用本地 mock 走真实 manager 调用和回调，重建池后 ban 仍不可选；迟到 mute/risk 不得降级或覆盖持久 ban。直接 `NoteError` ban 同样保持一次写入。
+- AC-P12：同一身份并发在途错误乱序到达时，已有较晚 mute 不得被较短 risk 改写（manager 和 lease 两层均须保持原 kind、期限）；跨 kind 的已知 park 期限只能延长不能缩短，短消息不得发出覆盖持久化；永久 ban 永远优先。只用虚构账户与确定期限，不改变 mute 加 1h／无截止 7 天策略。
+
+本轮 TDD 证据（`app/internal/upstream/pool_park_monotonic_test.go`）：RED 执行 `go test ./internal/upstream -run 'TestManagerBanIsPersistedExactlyOnceByLease|TestParkDeadlineMonotonicAcrossKinds' -count=1`，分别失败于 `ban persistence = []` 与两个跨 kind 的 manager 期限缩短；GREEN 同命令通过，增加 manager 预置 ban 后迟到错误测试通过。`go test ./... -count=1 -timeout=300s`、`go test -race ./... -count=1 -timeout=300s`、`go vet ./...`、`go build ./...`、`git diff --check` 均通过。测试只覆盖 mock，无真实账户／Redis 验证；ban 持久化依赖调用方将业务错误交给 lease `NoteError`。
+
 ## TDD 顺序
 
 1. 表征既有 AC-P01/P02/P06，复跑 `go test ./internal/upstream ./internal/server -count=1`；已有通过项作为基线，不制造假 RED。

@@ -1124,9 +1124,12 @@ func (c *Client) fileStatus(ctx context.Context, token, fileID string) (string, 
 type AccountManager struct {
 	client *Client
 
-	mu              sync.Mutex
-	token           string
-	ban             BanState
+	mu    sync.Mutex
+	token string
+	ban   BanState
+	// banParkPending is set when manager observes a permanent ban before the
+	// lease can write its durable park record. Protected by mu.
+	banParkPending  bool
 	banMsg          string
 	parkUntil       time.Time
 	cooldownUntil   time.Time // transient per-identity parallel-limit throttle
@@ -1218,6 +1221,7 @@ func (am *AccountManager) markBan(err error) {
 	switch BanKind(err) {
 	case BanBanned:
 		am.ban = BanBanned
+		am.banParkPending = true
 		am.parkUntil = time.Time{}
 		am.banMsg = "account banned: " + err.Error()
 	case BanMuted:
@@ -1233,19 +1237,23 @@ func (am *AccountManager) markBan(err error) {
 			duration = 7 * 24 * time.Hour
 		}
 		until = localMuteDeadline(until, duration)
-		if am.ban == BanMuted && am.parkUntil.After(until) {
+		if am.ban != BanNone && am.parkUntil.After(until) {
 			return
 		}
 		am.ban = BanMuted
 		am.parkUntil = until
 		am.banMsg = "account muted: " + err.Error()
 	case BanRiskDevice:
-		am.ban = BanRiskDevice
 		duration := am.riskCooldown
 		if duration <= 0 {
 			duration = 10 * time.Minute
 		}
-		am.parkUntil = time.Now().Add(duration)
+		until := time.Now().Add(duration)
+		if am.ban != BanNone && am.parkUntil.After(until) {
+			return
+		}
+		am.ban = BanRiskDevice
+		am.parkUntil = until
 		am.banMsg = "risk device detected: " + err.Error()
 	}
 }
