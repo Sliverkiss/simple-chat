@@ -16,6 +16,7 @@ import (
 	"context"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"simple-chat/internal/upstream"
@@ -24,10 +25,10 @@ import (
 // MemoryFirstStore caches every account record in memory and writes state
 // changes through to the backing store. Backing reads happen only at
 // construction; backing writes happen only at the write-through moments.
-// Fail-soft writes (ApplyPark/ApplyLogin) log and leave the in-memory state
-// correct — the next transition re-writes the full record, healing a missed
-// write. Hard writes (SaveAccount/DeleteAccount) propagate errors with the
-// cache untouched, so the admin API can answer 5xx honestly.
+// Login writes are fail-soft. A failed park write latches admission closed
+// for this process; it cannot be assumed to heal on a later transition.
+// Hard writes (SaveAccount/DeleteAccount) propagate errors with the cache
+// untouched, so the admin API can answer 5xx honestly.
 type MemoryFirstStore struct {
 	backing Store
 	logger  *log.Logger
@@ -46,7 +47,15 @@ type MemoryFirstStore struct {
 	// fenced is enabled by pool wiring; legacy direct callers may continue
 	// sending records without a generation when no pool uses this store.
 	fenced bool
+	// A lost park must not silently return to ready after a process restart.
+	// Once tripped, this process stops accepting new account leases.
+	parkWriteFailed atomic.Bool
 }
+
+// ParkWriteFailed reports a sticky persistence failure. Restarting with an
+// unchanged backing row cannot recover the lost event; operators must first
+// reconcile the backing state.
+func (s *MemoryFirstStore) ParkWriteFailed() bool { return s.parkWriteFailed.Load() }
 
 // NewMemoryFirstStore performs the one boot load from the backing store and
 // builds the in-memory cache. A validation failure is fatal (a corrupt
@@ -136,8 +145,7 @@ func (s *MemoryFirstStore) DeleteAccount(ctx context.Context, identity string) e
 // the full merged record through — no backing read (the old Redis
 // GET+merge+SET cycle is gone). Unknown identity is the same no-op the
 // backing stores take. Fail-soft: the in-memory pool state is already
-// correct when this runs; a failed write logs and heals on the next
-// transition.
+// correct when this runs; a failed write latches admission closed.
 func (s *MemoryFirstStore) ApplyPark(rec upstream.ParkRecord) {
 	s.mu.Lock()
 	acct, ok := s.accounts[rec.Mobile]
@@ -152,10 +160,11 @@ func (s *MemoryFirstStore) ApplyPark(rec upstream.ParkRecord) {
 	}
 	s.accounts[rec.Mobile] = acct
 	err := s.backing.SaveAccount(context.Background(), acct)
-	s.mu.Unlock()
 	if err != nil {
+		s.parkWriteFailed.Store(true)
 		logf(s.logger, "memory-first store: cannot persist park state (store error)")
 	}
+	s.mu.Unlock()
 }
 
 // ApplyLogin records one fresh login token on the cached account and writes

@@ -43,8 +43,15 @@ func (e *PoolBusyError) Is(target error) bool {
 // ErrPoolBusy is the sentinel matching PoolBusyError values.
 var ErrPoolBusy = &PoolBusyError{}
 
+// ErrParkPersistence indicates this process can no longer safely assign new
+// leases because a park transition was not confirmed by the backing store.
+var ErrParkPersistence = errors.New("pool: park persistence failed; account admission closed")
+
 // PoolConfig configures the pool.
 type PoolConfig struct {
+	// ParkWriteFailed closes admission after a failed durable park write.
+	// Nil preserves the behavior of memory-only pools.
+	ParkWriteFailed func() bool
 	// BaseURL overrides every region's base URL (tests inject httptest).
 	BaseURL string
 	// MaxInflight caps concurrent requests per account (default 2).
@@ -61,8 +68,8 @@ type PoolConfig struct {
 	// OnParkPersist receives every park-state transition (TASK_MUTE): a park
 	// (ban/mute/risk) or the natural unpark (Kind=BanNone). The sink is
 	// invoked synchronously under the account's lock, after the in-memory
-	// state is updated — persistence never gates the fast path's correctness,
-	// a failed write is the sink's problem to log.
+	// state is updated. Production memory-first stores latch failed writes
+	// and reject subsequent Acquire calls via ParkWriteFailed.
 	OnParkPersist func(ParkRecord)
 	// OnLoginPersist receives every successful login/relogin's fresh bearer
 	// token (docs-spec-memory-first.md): the write-through moment for the
@@ -513,6 +520,10 @@ func (p *Pool) tryAcquire(ctx context.Context) (*Lease, error) {
 
 func (p *Pool) tryAcquireExcluding(ctx context.Context, excludedIdentity string) (*Lease, error) {
 	p.mu.Lock()
+	if p.cfg.ParkWriteFailed != nil && p.cfg.ParkWriteFailed() {
+		p.mu.Unlock()
+		return nil, ErrParkPersistence
+	}
 	n := len(p.accounts)
 	if n == 0 {
 		// Empty ring (admin API removed every account): nothing can free a

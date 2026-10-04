@@ -95,14 +95,15 @@ const DefaultMaxPromptChars = 2_000_000
 
 // Server holds the account pool and routes.
 type Server struct {
-	pool      *upstream.Pool
-	logger    *log.Logger
-	apiKey    string
-	deleter   *asyncDeleter
-	maxPrompt int
-	sessions  *sessionRegistry
-	cleanup   *cleanupScheduler
-	purge     *purgeScheduler
+	pool            *upstream.Pool
+	parkWriteFailed func() bool
+	logger          *log.Logger
+	apiKey          string
+	deleter         *asyncDeleter
+	maxPrompt       int
+	sessions        *sessionRegistry
+	cleanup         *cleanupScheduler
+	purge           *purgeScheduler
 	// adminLifecycleMu serializes upload/delete across store and pool mutations.
 	adminLifecycleMu sync.Mutex
 	// store persists accounts for the admin API (upload/delete); nil when
@@ -121,8 +122,12 @@ func NewServer(cfg Config) (*Server, error) {
 	// expired parks; hand the pool a sink that writes every transition back.
 	// Nil ParkStore = memory-only park state.
 	var onParkPersist func(upstream.ParkRecord)
+	var parkWriteFailed func() bool
 	if cfg.ParkStore != nil {
 		onParkPersist = cfg.ParkStore.ApplyPark
+		if monitored, ok := cfg.ParkStore.(interface{ ParkWriteFailed() bool }); ok {
+			parkWriteFailed = monitored.ParkWriteFailed
+		}
 	}
 	// Login write-through (docs-spec-memory-first.md): a store that
 	// implements ApplyLogin receives every fresh login token. Stores that
@@ -145,6 +150,7 @@ func NewServer(cfg Config) (*Server, error) {
 		MaxInflight:           cfg.MaxInflight,
 		QueueWait:             cfg.QueueWait,
 		OnParkPersist:         onParkPersist,
+		ParkWriteFailed:       parkWriteFailed,
 		OnLoginPersist:        onLoginPersist,
 		PersistenceGeneration: persistenceGeneration,
 		RandomSeed:            cfg.RandomSeed,
@@ -180,15 +186,16 @@ func NewServer(cfg Config) (*Server, error) {
 	purge.start()
 	purge.logPolicy()
 	return &Server{
-		pool:      pool,
-		logger:    logger,
-		apiKey:    cfg.APIKey,
-		maxPrompt: cfg.MaxPromptChars,
-		deleter:   deleter,
-		sessions:  sessions,
-		cleanup:   cleanup,
-		purge:     purge,
-		store:     cfg.ParkStore,
+		pool:            pool,
+		parkWriteFailed: parkWriteFailed,
+		logger:          logger,
+		apiKey:          cfg.APIKey,
+		maxPrompt:       cfg.MaxPromptChars,
+		deleter:         deleter,
+		sessions:        sessions,
+		cleanup:         cleanup,
+		purge:           purge,
+		store:           cfg.ParkStore,
 	}, nil
 }
 
@@ -208,6 +215,10 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /v1/web_search", s.requireAPIKey(s.handleWebSearch))
 	mux.Handle("GET /v1/models", s.requireAPIKey(s.handleModels))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		if s.parkWriteFailed != nil && s.parkWriteFailed() {
+			http.Error(w, "park persistence failed", http.StatusServiceUnavailable)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		io.WriteString(w, "ok")
 	})
@@ -909,6 +920,10 @@ func (s *Server) deliverNonStream(ctx context.Context, w http.ResponseWriter, le
 
 // writePoolError maps pool-level failures to client-facing responses.
 func (s *Server) writePoolError(w http.ResponseWriter, err error) {
+	if errors.Is(err, upstream.ErrParkPersistence) {
+		writeError(w, http.StatusServiceUnavailable, "park persistence unavailable", "upstream_error", "park_persistence_failed")
+		return
+	}
 	var busy *upstream.PoolBusyError
 	if errors.As(err, &busy) {
 		retry := int(busy.RetryAfter / time.Second)
