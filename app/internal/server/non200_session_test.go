@@ -55,8 +55,12 @@ func TestNon200CompletionMuteParksIdentity(t *testing.T) {
 		t.Fatalf("completion replayed %d", n)
 	}
 	stored := readAccountsFile(t, path)[0]
-	if stored.ParkKind != "muted" || stored.ParkUntil == "" {
+	if stored.ParkKind != "muted" {
 		t.Fatalf("park=%+v, want mute until %s", stored, until)
+	}
+	parkUntil, err := time.Parse(time.RFC3339, stored.ParkUntil)
+	if err != nil || !parkUntil.Equal(until) {
+		t.Fatalf("park_until=%q, want %s (err=%v)", stored.ParkUntil, until, err)
 	}
 	resp, err = http.Post(gw.URL+"/v1/chat/completions", "application/json", strings.NewReader(switchRequest))
 	if err != nil {
