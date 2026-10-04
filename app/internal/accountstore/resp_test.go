@@ -7,9 +7,11 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"net"
+	"simple-chat/internal/upstream"
 	"strings"
 	"sync"
 	"testing"
@@ -153,6 +155,32 @@ func (f *fakeRedis) handle(conn net.Conn) {
 			continue
 		}
 		switch verb {
+		case "EVAL":
+			if len(cmd) != 14 || !strings.HasPrefix(cmd[1], "-- simple-chat-patch-v1") || cmd[2] != "1" {
+				fmt.Fprint(w, "-ERR unsupported EVAL\r\n")
+				break
+			}
+			f.mu.Lock()
+			raw, ok := f.data[cmd[3]]
+			var acct upstream.Account
+			if ok {
+				_ = json.Unmarshal([]byte(raw), &acct)
+			}
+			if !ok || acct.StoreEpoch != cmd[4] {
+				fmt.Fprint(w, ":0\r\n")
+			} else if cmd[5] == "park" && (acct.ParkKind != cmd[6] || acct.ParkUntil != cmd[7] || acct.ParkReason != cmd[8] || acct.ParkedAt != cmd[9]) {
+				fmt.Fprint(w, ":0\r\n")
+			} else {
+				if cmd[5] == "park" {
+					acct.ParkKind, acct.ParkUntil, acct.ParkReason, acct.ParkedAt = cmd[10], cmd[11], cmd[12], cmd[13]
+				} else {
+					acct.SessionToken = cmd[10]
+				}
+				out, _ := json.Marshal(acct)
+				f.data[cmd[3]] = string(out)
+				fmt.Fprint(w, ":1\r\n")
+			}
+			f.mu.Unlock()
 		case "AUTH":
 			if len(cmd) >= 2 && cmd[len(cmd)-1] == f.password {
 				authenticated = true
