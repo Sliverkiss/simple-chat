@@ -106,7 +106,8 @@ func TestMuteGraceFromEnvelopeOnEveryEndpoint(t *testing.T) {
 				if len(recs) != 1 || !recs[0].Until.Equal(want) || !p.Snapshot()[0].ParkUntil.Equal(want) {
 					t.Fatalf("park=%+v snapshot=%+v want=%s", recs, p.Snapshot(), want)
 				}
-				if _, err := p.Acquire(context.Background()); !errors.Is(err, ErrPoolBusy) {
+				var parked *PoolParkedError
+				if _, err := p.Acquire(context.Background()); !errors.As(err, &parked) || !parked.Until.Equal(want) {
 					t.Fatalf("muted identity selectable: %v", err)
 				}
 			})

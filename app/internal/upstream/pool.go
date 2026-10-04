@@ -43,6 +43,16 @@ func (e *PoolBusyError) Is(target error) bool {
 // ErrPoolBusy is the sentinel matching PoolBusyError values.
 var ErrPoolBusy = &PoolBusyError{}
 
+// PoolParkedError means no identity is ready and the nearest known local
+// unpark deadline is Until. It is not a capacity/QueueWait failure.
+type PoolParkedError struct{ Until time.Time }
+
+func (e *PoolParkedError) Error() string { return "upstream: all eligible accounts parked" }
+
+// ErrNoEligibleAccount indicates a parked pool without any known recovery
+// deadline. Do not advertise a fabricated Retry-After for this case.
+var ErrNoEligibleAccount = errors.New("upstream: no eligible account with known recovery")
+
 // ErrParkPersistence indicates this process can no longer safely assign new
 // leases because a park transition was not confirmed by the backing store.
 var ErrParkPersistence = errors.New("pool: park persistence failed; account admission closed")
@@ -442,7 +452,7 @@ func (p *Pool) healthNow(pa *poolAccount, now time.Time) health {
 		return healthBanned
 	}
 	// Muted/risk parks are time-bounded by parkUntil.
-	if !pa.am.parkUntil.IsZero() && now.After(pa.am.parkUntil) {
+	if !pa.am.parkUntil.IsZero() && !now.Before(pa.am.parkUntil) {
 		pa.am.parkUntil = time.Time{}
 		if pa.am.ban == BanMuted || pa.am.ban == BanRiskDevice {
 			pa.am.ban = BanNone
@@ -499,6 +509,12 @@ func (p *Pool) acquireWithWait(ctx context.Context, excludedIdentity string) (*L
 		if err == nil {
 			return lease, time.Since(started), nil
 		}
+		var parked *PoolParkedError
+		if errors.As(err, &parked) && !time.Now().Before(parked.Until) {
+			// The earliest park may have expired while selection was blocked
+			// on another identity lock. Re-scan before emitting a stale 429.
+			continue
+		}
 		if !errors.Is(err, ErrPoolBusy) {
 			return nil, time.Since(started), err
 		}
@@ -534,6 +550,9 @@ func (p *Pool) tryAcquireExcluding(ctx context.Context, excludedIdentity string)
 	now := time.Now()
 	var anyBanned bool
 	var distinctReady bool
+	var parked bool
+	var earliest time.Time
+	var unknownRecovery bool
 	ready := make([]*poolAccount, 0, n)
 	for i := 0; i < n; i++ {
 		pa := p.accounts[i]
@@ -546,7 +565,21 @@ func (p *Pool) tryAcquireExcluding(ctx context.Context, excludedIdentity string)
 			continue
 		}
 		if h != healthReady {
-			continue // parked (muted/risk): skip but not permanently
+			// healthNow has reconciled expired parks. Snapshot the actual
+			// eligibility deadline while holding both pool and manager locks.
+			pa.am.mu.Lock()
+			until := pa.am.parkUntil
+			if h == healthCooling {
+				until = pa.am.cooldownUntil
+			}
+			pa.am.mu.Unlock()
+			parked = true
+			if until.After(now) && (earliest.IsZero() || until.Before(earliest)) {
+				earliest = until
+			} else if !until.After(now) {
+				unknownRecovery = true
+			}
+			continue
 		}
 		distinctReady = true
 		if pa.isBusy() {
@@ -595,6 +628,12 @@ func (p *Pool) tryAcquireExcluding(ctx context.Context, excludedIdentity string)
 	p.mu.Unlock()
 	if allGone {
 		return nil, ErrNoAccounts
+	}
+	if !distinctReady && parked {
+		if earliest.IsZero() || unknownRecovery {
+			return nil, ErrNoEligibleAccount
+		}
+		return nil, &PoolParkedError{Until: earliest}
 	}
 	return nil, ErrPoolBusy
 }

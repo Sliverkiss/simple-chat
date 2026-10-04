@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -135,10 +136,7 @@ func TestOP06PoolClassificationsThroughHTTP(t *testing.T) {
 		retry  bool
 	}{
 		{name: "all_banned", park: []upstream.BizError{{BizCode: 10}, {BizCode: 10}}, status: 503, code: "no_accounts"},
-		// Compatibility baseline: the existing API reports all parked as
-		// pool_busy/429, despite there being no capacity contention. Do not
-		// silently change this client-visible contract in OP-06.
-		{name: "all_muted_compat", park: []upstream.BizError{{BizCode: 5}, {BizCode: 5}}, status: 429, code: "pool_busy", retry: true},
+		{name: "all_muted", park: []upstream.BizError{{BizCode: 5}, {BizCode: 5}}, status: 429, code: "pool_parked", retry: true},
 		{name: "all_busy", busy: true, status: 429, code: "pool_busy", retry: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -178,6 +176,12 @@ func TestOP06PoolClassificationsThroughHTTP(t *testing.T) {
 			}
 			if status != tc.status || result.Error.Code != tc.code || (after != "") != tc.retry || elapsed > time.Second {
 				t.Fatalf("status=%d code=%q retry=%q elapsed=%s body=%s", status, result.Error.Code, after, elapsed, body)
+			}
+			if tc.name == "all_muted" {
+				seconds, err := strconv.Atoi(after)
+				if err != nil || seconds < 7*24*3600-1 || seconds > 7*24*3600 {
+					t.Fatalf("missing mute_until fallback Retry-After=%q, want local 7d", after)
+				}
 			}
 			calls, _ := f.snapshot()
 			if len(calls) != 0 {

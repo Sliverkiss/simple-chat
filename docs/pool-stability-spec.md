@@ -19,7 +19,7 @@
 | OP-03 mute 移出轮转 | A 首次收到 biz5，带有效未来 `mute_until=T`，或无有效截止时间；其余账号仍健康 | A 立刻不再取得**新**聊天/搜索 lease；写 Redis 的本地截止分别为 `T+1h` 或首次观测起 7 天；B 继续服务；在途 lease 不可撤销，但不能引出新的 A lease | HTTP 200/非 200 三入口与并发 barrier，回读 backing 和后续请求身份 |
 | OP-04 重启与恢复 | A 已持久 muted，进程重建；随后时间跨过本地截止 | 截止前不对 A 发上游请求；截止后自然进入候选并清除持久停用标记；永久 ban 永不随时间复活；迟到较短错误不缩短期限 | 重建 server/store/pool 的本地持久 fixture、受控时间边界及候选/持久状态断言 |
 | OP-05 持久化故障 | A 的停放 backing 写失败，另有看似 ready 账号 | 当前进程关闭新租约，聊天/搜索与健康检查返回 503；热重建不能解除锁存；不得把旧 Redis 行当成功落盘 | 注入失败 backing 后调用真实 handler/healthz；记录重启后无法保证的边界 |
-| OP-06 空池与分类 | 全部停用、全部忙碌、永久 ban、限流、transport 故障分别触发 | 有限等待与对应错误，不无限换号或对 mute/ban 立即重试；日志/响应不泄漏凭据或身份 | handler 黑盒响应码、Retry-After 与上游请求计数 |
+| OP-06 空池与分类 | 全部停用、全部忙碌、永久 ban、限流、transport 故障分别触发 | 全停放立即 `429 pool_parked`，Retry-After 指向最近恢复；真正容量满维持 QueueWait 后 `429 pool_busy`；永久 ban 全部维持 `503 no_accounts`；不无限换号或对 mute/ban 立即重试；不泄漏身份 | 聊天与搜索 handler 黑盒响应码、Retry-After 与上游请求计数 |
 
 **执行顺序**：先做 OP-01/03/04 的纵向闭环测试；若现有行为已满足，记录 GREEN 基线，不制造假 RED。若不满足，先见到该合同对应的 RED 再最小修复为 GREEN；再覆盖 OP-02/05/06。每一轮独立重跑完整测试、race、vet、build，逐项填证据与未覆盖项。离线闭环通过仅证明本地协议/状态机，不代替生产 Redis 与真实上游验证。
 
@@ -27,7 +27,9 @@
 
 `app/internal/server/pool_op0206_http_test.go` 经真实 handler + 本地假上游验证：占满 A 后 B 能服务；A 首字节前 HTTP 500 时，若 B 忙碌，仅等待设定的 QueueWait 并返回 `429 pool_busy`，不偷换回 A；现有切号/提交边界测试另覆盖安全换号、独立 session、可见 SSE delta 后不重放。首次探测 biz 5/10 各仅请求一次，不立即换号；全部永久 ban 返回 `503 no_accounts` 且不发上游请求；全部容量满返回 `429 pool_busy` + Retry-After。测试显式将 QueueWait 设为 40ms，只证明这个有界配置。
 
-**待决兼容行为（本轮不修改生产响应）**：全部 muted/risk/cooling 时，池当前把“无 ready 候选”也分类为 busy，按默认 QueueWait **30s** 排队后返回 `429 pool_busy` + Retry-After；与“容量耗尽”响应无法区分，`Retry-After` 不表示停放恢复期限。改成快速 `503 no_eligible_account` 或其它分类会改变既有 429/错误码契约，须先由调用方确认迁移方式。当前测试将这一行为明确标作兼容基线，不能称 OP-06 的全停放快返要求已完成。无真实 Redis/上游验收。
+**OP-06 已决合同**：无 ready 身份、至少一名有期限的 muted/risk/cooling（其余允许永久 ban）时，立即返回 `429 pool_parked`，`Retry-After` 为最近本地恢复期限剩余秒数向上取整（最少 1 秒），不以 QueueWait 排队；接近到期时重新检查状态，以免错过到期可用身份。risk 使用池内已有的 cooldown 截止；若**任何**非永久停放身份缺失/损坏截止时间（包括与已知截止混合），安全地返回 `503 no_eligible_account`、不附 Retry-After，不伪造全池最近恢复承诺。只要有 ready 但容量满仍按原 QueueWait 返回 `429 pool_busy`，其 Retry-After 仍是排队提示；全部永久 ban/空池维持 `503 no_accounts`。这将原先全停放的 `pool_busy` 错误码改为 `pool_parked`，状态码仍为 429；首次上游 mute/risk 的原请求错误码不变，首字节前安全切号规则不变。验证仅用虚构身份、本地 HTTP mock，不连真实 Redis/上游。
+
+OP-06 本地 TDD：修改原 HTTP 表征先见 RED（all_muted 得 `pool_busy`，耗尽 QueueWait 而不是 `pool_parked`）；实施后扩展聊天、搜索混合 ban/mute/risk、全 risk、全 cooldown、全忙及缺失 mute 截止的 fallback。deadline 在选择期间到期的包级 RED 曾返回过时 parked，复查后 GREEN。未知截止的包级测试及 HTTP 映射测试均通过。全量 `go test ./... -count=1 -timeout=300s`、race 同命令、`go vet ./...`、`go build ./...` 通过；旧包级断言 `ErrPoolBusy` 已按新的有期限 park 类型更新。无真实 Redis 或生产流量验收。
 
 ## 可观测验收矩阵
 

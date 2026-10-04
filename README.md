@@ -135,6 +135,16 @@ One search = one upstream completion (thinking forced off to stay on the fast
 search path). Empty results are an honest empty list. Malformed bodies answer
 `400`.
 
+For both chat completions and standalone search, when every available account
+is temporarily parked (mute, risk or cooldown), the gateway responds promptly
+with `429 pool_parked`. `Retry-After` is the seconds rounded up until the
+earliest local recovery deadline (not a promise of capacity). A ready account
+at capacity still waits for `QueueWait` and returns `429 pool_busy`; all
+permanently banned/empty pools return `503 no_accounts`. If recovery timing is
+unknown, the response is `503 no_eligible_account` without `Retry-After`.
+Clients that previously interpreted every pool-level 429 as `pool_busy` should
+handle `pool_parked` separately.
+
 ## 🛠️ Admin API (account management)
 
 Manage the account pool over HTTP after deployment — container filesystems

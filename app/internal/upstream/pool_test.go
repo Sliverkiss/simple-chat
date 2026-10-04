@@ -238,13 +238,14 @@ func TestPoolMutedParksUntilMuteUntil(t *testing.T) {
 	l.NoteError(&BizError{BizCode: 5, BizMsg: "user is muted", MuteUntil: until})
 	l.Release()
 
-	// While muted the pool must refuse; the queue wait (50ms) expires first.
-	if _, err := pool.Acquire(context.Background()); !errors.Is(err, ErrPoolBusy) {
-		t.Fatalf("want ErrPoolBusy while muted, got %v", err)
+	// While muted the pool returns its local recovery deadline immediately.
+	var parked *PoolParkedError
+	if _, err := pool.Acquire(context.Background()); !errors.As(err, &parked) {
+		t.Fatalf("want PoolParkedError while muted, got %v", err)
 	}
 	// The upstream deadline itself is insufficient: local grace remains.
 	time.Sleep(130 * time.Millisecond)
-	if _, err := pool.Acquire(context.Background()); !errors.Is(err, ErrPoolBusy) {
+	if _, err := pool.Acquire(context.Background()); !errors.As(err, &parked) {
 		t.Fatalf("account returned before local grace expired: %v", err)
 	}
 	pool.mu.Lock()
@@ -275,8 +276,9 @@ func TestPoolMutedWithoutUntilUsesDefault(t *testing.T) {
 	l, _ := pool.Acquire(context.Background())
 	l.NoteError(&BizError{BizCode: 5, BizMsg: "user is muted"}) // no MuteUntil
 	l.Release()
-	if _, err := pool.Acquire(context.Background()); !errors.Is(err, ErrPoolBusy) {
-		t.Fatalf("want ErrPoolBusy during default mute park, got %v", err)
+	var parked *PoolParkedError
+	if _, err := pool.Acquire(context.Background()); !errors.As(err, &parked) {
+		t.Fatalf("want PoolParkedError during default mute park, got %v", err)
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for {
@@ -300,8 +302,9 @@ func TestPoolRiskDeviceCooldown(t *testing.T) {
 	l, _ := pool.Acquire(context.Background())
 	l.NoteError(&BizError{BizCode: 11, BizMsg: "RISK_DEVICE_DETECTED"})
 	l.Release()
-	if _, err := pool.Acquire(context.Background()); !errors.Is(err, ErrPoolBusy) {
-		t.Fatalf("want ErrBusy during risk cooldown, got %v", err)
+	var parked *PoolParkedError
+	if _, err := pool.Acquire(context.Background()); !errors.As(err, &parked) {
+		t.Fatalf("want PoolParkedError during risk cooldown, got %v", err)
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for {

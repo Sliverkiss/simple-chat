@@ -925,6 +925,22 @@ func (s *Server) writePoolError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusServiceUnavailable, "park persistence unavailable", "upstream_error", "park_persistence_failed")
 		return
 	}
+	var parked *upstream.PoolParkedError
+	if errors.As(err, &parked) {
+		// The deadline is the pool's local eligibility time, not QueueWait.
+		// Ceil protects subsecond remaining windows from premature retries.
+		seconds := int(math.Ceil(time.Until(parked.Until).Seconds()))
+		if seconds < 1 {
+			seconds = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(seconds))
+		writeError(w, http.StatusTooManyRequests, "all accounts temporarily parked, retry later", "rate_limit_error", "pool_parked")
+		return
+	}
+	if errors.Is(err, upstream.ErrNoEligibleAccount) {
+		writeError(w, http.StatusServiceUnavailable, "no eligible account with known recovery", "upstream_error", "no_eligible_account")
+		return
+	}
 	var busy *upstream.PoolBusyError
 	if errors.As(err, &busy) {
 		retry := int(busy.RetryAfter / time.Second)
