@@ -51,6 +51,12 @@
 
 本轮 TDD 证据（`app/internal/upstream/pool_park_monotonic_test.go`）：RED 执行 `go test ./internal/upstream -run 'TestManagerBanIsPersistedExactlyOnceByLease|TestParkDeadlineMonotonicAcrossKinds' -count=1`，分别失败于 `ban persistence = []` 与两个跨 kind 的 manager 期限缩短；GREEN 同命令通过，增加 manager 预置 ban 后迟到错误测试通过。`go test ./... -count=1 -timeout=300s`、`go test -race ./... -count=1 -timeout=300s`、`go vet ./...`、`go build ./...`、`git diff --check` 均通过。测试只覆盖 mock，无真实账户／Redis 验证；ban 持久化依赖调用方将业务错误交给 lease `NoteError`。
 
+## mute 原始时间跨入口过期及 429 提示（本地 SDD）
+
+- AC-P13：同一 biz5 错误的 `mute_until=T` 在 manager 观察时有效，至 lease 处理时已过期，仍沿用首次计算的 `T+1h`，不能回退为 7 天；并发期间若已有更长 park，则保持更长期限与 kind，不追加较短持久记录。原始 `BizError.MuteUntil` 保持不变；真正首次收到无效时间仍按 7 天。
+- AC-P14：429 `Retry-After` 是**请求重试的保守提示**，不是某个身份可用的承诺或身份信息。响应体维持现有 `account_muted` 业务码，不暴露账户标识。已持有 lease 的请求采用池最终本地 `parkUntil` 作为秒级向上取整提示，不能早于最终 park；没有 lease 的旧错误映射路径维持由原始时间推算的兼容兜底。多个候选可能提前可用，提示并不承诺届时必成功，也不改变 parallel-limit 429 的独立短冷却语义。
+- 验收：本地双入口时间跨界及迟到 risk 的测试、保留较长 park 的 HTTP 错误映射测试；无真实上游、Redis 或账号请求。
+
 ## TDD 顺序
 
 1. 表征既有 AC-P01/P02/P06，复跑 `go test ./internal/upstream ./internal/server -count=1`；已有通过项作为基线，不制造假 RED。

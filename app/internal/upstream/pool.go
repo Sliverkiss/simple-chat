@@ -650,6 +650,13 @@ type Lease struct {
 // Account returns the account config for this lease.
 func (l *Lease) Account() Account { return l.pa.account }
 
+// ParkUntil returns the effective local deadline without exposing identity.
+func (l *Lease) ParkUntil() time.Time {
+	l.pa.am.mu.Lock()
+	defer l.pa.am.mu.Unlock()
+	return l.pa.am.parkUntil
+}
+
 // Client returns the upstream client bound to this account.
 func (l *Lease) Client() *Client { return l.pa.client }
 
@@ -713,13 +720,17 @@ func (l *Lease) NoteError(err error) {
 		if be != nil {
 			until = be.MuteUntil
 		}
-		// The manager may have parked this same biz5 before NoteError sees it.
-		// A fallback is relative to observation time, so recomputing it here
-		// would extend the deadline on every duplicate report.
-		if l.pa.am.ban == BanMuted && (be == nil || !be.MuteUntil.After(time.Now())) && l.pa.am.parkUntil.After(time.Now()) {
-			until = l.pa.am.parkUntil
+		if be != nil && !be.localMutePark.IsZero() {
+			until = be.localMutePark
 		} else {
-			until = localMuteDeadline(until, l.pool.cfg.MuteParkDefault)
+			// The manager may have parked this same biz5 before NoteError sees it.
+			// A fallback is relative to observation time, so recomputing it here
+			// would extend the deadline on every duplicate report.
+			if l.pa.am.ban == BanMuted && (be == nil || !be.MuteUntil.After(time.Now())) && l.pa.am.parkUntil.After(time.Now()) {
+				until = l.pa.am.parkUntil
+			} else {
+				until = localMuteDeadline(until, l.pool.cfg.MuteParkDefault)
+			}
 		}
 		// Concurrent leases may report older/shorter mute windows out of
 		// order. Never make a known mute eligible sooner.

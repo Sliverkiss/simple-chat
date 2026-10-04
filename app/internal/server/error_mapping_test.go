@@ -1,14 +1,49 @@
 package server
 
 import (
+	"context"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"simple-chat/internal/upstream"
 )
+
+// Retry-After is a conservative request retry hint, not an account identity
+// disclosure or a guarantee that the next attempt will succeed.
+func TestMutedRetryAfterDoesNotPrecedeRetainedPark(t *testing.T) {
+	p, err := upstream.NewPool([]upstream.Account{{Mobile: "13800000000", Password: "fixture"}}, upstream.PoolConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l, err := p.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Release()
+	long := &upstream.BizError{BizCode: 5, BizMsg: "muted", MuteUntil: time.Now().Add(48 * time.Hour)}
+	l.NoteError(long)
+	short := &upstream.BizError{BizCode: 5, BizMsg: "muted", MuteUntil: time.Now().Add(time.Minute)}
+	l.NoteError(short)
+	w := httptest.NewRecorder()
+	s := &Server{logger: log.New(io.Discard, "", 0)}
+	s.writeUpstreamError(w, short, l)
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("status=%d", w.Code)
+	}
+	seconds, err := strconv.Atoi(w.Header().Get("Retry-After"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Now().Add(time.Duration(seconds) * time.Second).Before(p.Snapshot()[0].ParkUntil) {
+		t.Fatalf("Retry-After %d precedes retained park %s", seconds, p.Snapshot()[0].ParkUntil)
+	}
+}
 
 // bizEnvelope writes a 200 JSON completion answer carrying a biz error.
 func bizEnvelope(w http.ResponseWriter, biz int, msg string, bizData string) {

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -348,7 +349,7 @@ func (s *Server) runWebSearchAttempt(ctx context.Context, w http.ResponseWriter,
 	tok, err := lease.Token(ctx)
 	if err != nil {
 		lease.NoteError(err)
-		s.writeUpstreamError(w, err)
+		s.writeUpstreamError(w, err, lease)
 		return false
 	}
 
@@ -359,7 +360,7 @@ func (s *Server) runWebSearchAttempt(ctx context.Context, w http.ResponseWriter,
 			previous.err, previous.allowSameAccount = err, true
 			return true
 		}
-		s.writeUpstreamError(w, err)
+		s.writeUpstreamError(w, err, lease)
 		return false
 	}
 	// App-like lifecycle (apk-behavior.md §8 D1): the session persists — the
@@ -380,7 +381,7 @@ func (s *Server) runWebSearchAttempt(ctx context.Context, w http.ResponseWriter,
 			previous.err, previous.allowSameAccount = err, true
 			return true
 		}
-		s.writeUpstreamError(w, err)
+		s.writeUpstreamError(w, err, lease)
 		return false
 	}
 	defer stream.Close()
@@ -414,7 +415,7 @@ func (s *Server) runWebSearchAttempt(ctx context.Context, w http.ResponseWriter,
 			previous.err, previous.allowSameAccount = st.Err, false
 			return true
 		}
-		s.writeUpstreamError(w, st.Err)
+		s.writeUpstreamError(w, st.Err, lease)
 		return false
 	case readErr != nil:
 		s.logger.Printf("web search transport error (attempt %d, %s)", attempt, consoleErrorClass(readErr))
@@ -555,7 +556,7 @@ func (s *Server) runAttempt(ctx context.Context, w http.ResponseWriter, req *ope
 	tok, err := lease.Token(ctx)
 	if err != nil {
 		lease.NoteError(err)
-		s.writeUpstreamError(w, err)
+		s.writeUpstreamError(w, err, lease)
 		termination = "token_error"
 		return false
 	}
@@ -581,7 +582,7 @@ func (s *Server) runAttempt(ctx context.Context, w http.ResponseWriter, req *ope
 			previous.err, previous.allowSameAccount = err, true
 			return true
 		}
-		s.writeUpstreamError(w, err)
+		s.writeUpstreamError(w, err, lease)
 		return false
 	}
 	s.sessions.record(lease.Account().Mobile, sessionID, lease.Client(), tok)
@@ -600,7 +601,7 @@ func (s *Server) runAttempt(ctx context.Context, w http.ResponseWriter, req *ope
 			previous.allowSameAccount = true
 			return true
 		}
-		s.writeUpstreamError(w, err)
+		s.writeUpstreamError(w, err, lease)
 		return false
 	}
 
@@ -759,7 +760,7 @@ func (s *Server) deliverStream(ctx context.Context, w http.ResponseWriter, lease
 				}
 				// Terminal pre-commit failure: the client connection is still
 				// clean — answer with a real HTTP error, not an empty 200.
-				s.writeUpstreamError(w, st.Err)
+				s.writeUpstreamError(w, st.Err, lease)
 				return false
 			}
 			if errors.Is(st.Err, sse.ErrContentFilter) {
@@ -881,7 +882,7 @@ func (s *Server) deliverNonStream(ctx context.Context, w http.ResponseWriter, le
 			s.logger.Printf("retry ladder: switching account for attempt %d", attempt+1)
 			return true
 		}
-		s.writeUpstreamError(w, st.Err)
+		s.writeUpstreamError(w, st.Err, lease)
 		return false
 	case readErr != nil:
 		*termination = "transport_error"
@@ -944,7 +945,7 @@ func (s *Server) writePoolError(w http.ResponseWriter, err error) {
 // writeUpstreamError maps upstream failures to OpenAI error shapes.
 // Client-facing text is stable and minimal (gap-analysis §4.6): raw err.Error()
 // can leak upstream biz_msg internals and pool detail. Details live in logs.
-func (s *Server) writeUpstreamError(w http.ResponseWriter, err error) {
+func (s *Server) writeUpstreamError(w http.ResponseWriter, err error, lease ...*upstream.Lease) {
 	s.logger.Printf("upstream error: %s", consoleErrorClass(err))
 	status := http.StatusBadGateway
 	typ := "upstream_error"
@@ -980,7 +981,17 @@ func (s *Server) writeUpstreamError(w http.ResponseWriter, err error) {
 	// Muted: surface the parking window as Retry-After (spec table).
 	var muteBE *upstream.BizError
 	if errors.As(err, &muteBE) && muteBE.BizCode == 5 {
-		s.setMuteRetryAfter(w, muteBE)
+		until := muteBE.MuteUntil
+		if !until.After(time.Now()) {
+			until = time.Now().Add(7 * 24 * time.Hour)
+		} else {
+			until = until.Add(time.Hour)
+		}
+		if len(lease) != 0 && lease[0] != nil && !lease[0].ParkUntil().IsZero() {
+			// The pool has already reconciled this error with prior reports.
+			until = lease[0].ParkUntil()
+		}
+		s.setMuteRetryAfter(w, until)
 	}
 	// Mid-stream parallel-generation limit: 429, retryable.
 	var se *sse.StreamError
@@ -999,12 +1010,11 @@ func (s *Server) writeUpstreamError(w http.ResponseWriter, err error) {
 // setMuteRetryAfter derives the 429 Retry-After header from the same local
 // policy as account parking. The upstream timestamp itself is not the local
 // eligibility deadline.
-func (s *Server) setMuteRetryAfter(w http.ResponseWriter, be *upstream.BizError) {
-	until := be.MuteUntil
-	if !until.After(time.Now()) {
-		until = time.Now().Add(7 * 24 * time.Hour)
-	} else {
-		until = until.Add(time.Hour)
+func (s *Server) setMuteRetryAfter(w http.ResponseWriter, until time.Time) {
+	// Round up: the advertised request retry time must not precede local park.
+	seconds := int(math.Ceil(time.Until(until).Seconds()))
+	if seconds < 1 {
+		seconds = 1
 	}
-	w.Header().Set("Retry-After", strconv.Itoa(int(time.Until(until).Round(time.Second)/time.Second)))
+	w.Header().Set("Retry-After", strconv.Itoa(seconds))
 }

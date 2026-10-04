@@ -273,6 +273,9 @@ type BizError struct {
 	BizMsg     string
 	// MuteUntil carries the upstream mute_until for biz 5 (muted), when sent.
 	MuteUntil time.Time
+	// localMutePark is set when the manager first validates this error's raw
+	// timestamp; the lease reads it under the same account-manager mutex.
+	localMutePark time.Time
 }
 
 func (e *BizError) Error() string {
@@ -1228,6 +1231,17 @@ func (am *AccountManager) markBan(err error) {
 		until := time.Time{}
 		if be != nil {
 			until = be.MuteUntil
+		}
+		if be != nil && until.After(time.Now()) && be.localMutePark.IsZero() {
+			be.localMutePark = until.Add(time.Hour)
+		}
+		if be != nil && !be.localMutePark.IsZero() {
+			until = be.localMutePark
+			if am.ban != BanNone && am.parkUntil.After(until) {
+				return
+			}
+			am.ban, am.parkUntil, am.banMsg = BanMuted, until, "account muted: "+err.Error()
+			return
 		}
 		if am.ban == BanMuted && (be == nil || !be.MuteUntil.After(time.Now())) && am.parkUntil.After(time.Now()) {
 			return // duplicate fallback report must not slide the local deadline
