@@ -31,6 +31,12 @@
 
 排查前提：本地直接 `NewPool` 若未配置 `OnParkPersist`，不能据此断言生产 Redis 未写；生产通过 `main.go → server.NewServer(ParkStore)` 配置写入回调。所有验证仅使用固定虚构凭据、httptest 和本地 store，不触碰真实上游/Redis。若现有行为满足上述矩阵，只补表征测试和证据，不制造假 RED 或改风控参数。
 
+## 非 200 响应分类补充验收（本地 mock）
+
+- AC-P08：completion 返回 HTTP 非 200 且有效 JSON envelope 明确 biz_code=5 和 mute_until 时，原请求返回 mute/Retry-After，不重放，池和配置 store 按上游期限停用该身份；普通非 JSON 5xx 仍是可重试 HTTP 错误，401/403 的既有鉴权刷新不回归。使用 httptest + 本地 store。
+- AC-P09：postJSON（包括建 session）收到 HTTP 非 200 的 biz 5 保留 mute_until；HTTP 503 的 JSON 成功空 envelope（无明确业务拒绝）作为服务故障可重试，明确 biz_code 或 outer code 的拒绝不可重试。只用本地 HTTP mock，不接真实服务。
+- AC-P10：建 session 失败发生在客户端输出前；安全 transport/HTTP 5xx 可以先在原有客户端预检重试一次，再按请求剩余次数切换另一物理身份；mute/auth/明确业务拒绝不可换号，不发送 completion，不超出请求尝试上限。Web search 和普通聊天均验证。
+
 ## TDD 顺序
 
 1. 表征既有 AC-P01/P02/P06，复跑 `go test ./internal/upstream ./internal/server -count=1`；已有通过项作为基线，不制造假 RED。
