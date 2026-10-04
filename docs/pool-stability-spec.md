@@ -114,4 +114,10 @@ TDD 证据：先新增 `TestInvalidParkDeadlineLoadPreservesQuarantine`，在原
 - `NoteError` 在 pool/account 锁内同步写回，其他需这些锁的请求可能额外等待在途 IO；一个已连接且无回包的命令至多等待上述 2 秒，但并发排队、多个串行命令／重拨以及系统调度不保证全局 wall-clock 上界。超时后的故障锁存不会在重拨成功时自行解除。崩溃后仍受上节已声明的重启缺口约束。
 - TDD 证据：`TestRESPStalledWriteReplyTimesOutWithoutReplay` RED 为 `SET waited without bound for Redis reply`（3.00s），GREEN 在约 2.00s 返回并断开；`TestRESPStalledCommandWriteTimesOut` 验证写卡住同样有限返回，`TestOP05StalledRedisParkClosesAdmission` 用本地 RESP + 实际 store/pool/HTTP 路径验证 503。`go test ./... -count=1 -timeout=300s`、`go test -race ./... -count=1 -timeout=300s`、`go vet ./...`、`go build ./...` 和 `git diff --check` 通过；仅是离线协议/单进程验证。
 
+### OP-05 自然恢复写盘失败的同次准入
+
+- `tryAcquireExcluding` 的入口故障检查不足以覆盖本次扫描：`healthNow` 在池锁和账户锁内自然清除已到期停放，并同步调用 `ApplyPark`；若 backing 的清除写失败，锁存会在入口检查之后改变。同次扫描即使已有其他 ready 候选也必须返回 `ErrParkPersistence`、不发 lease；聊天和 Web 搜索拒绝新请求，`/healthz` 为 503，热替换不能解除锁存。
+- 在候选分配前重新检查原子故障门；无 ready 的终态分类分支也会再次调用 `healthNow`，分类返回前同样检查。检查只读 `ParkWriteFailed` 的原子值，不在池锁内反向获取存储锁。现有 `NoteError` 持池锁写停放、`Status`/`Snapshot`/`ActiveAccountRefs` 可触发自然清除；它们触发的故障也由后续新 Acquire 的入口故障门阻断，已发 lease 仍不可撤销。
+- `TestOP05ExpiredParkClearFailsWithinAcquireClosesAdmission` 以虚构 backing **仅拒绝自然 clear 写**，验证当前 Acquire 无 lease、持久行仍 muted、聊天/搜索与健康检查 503、上游调用为零、热替换不解锁；RED：同次 Acquire 误发 lease；GREEN：同次拒绝。仅验证本进程，不声称解决上节的重启缺口。
+
 预工具基线的 retry ladder 原本允许单账号部分错误重新尝试；账户排除必须不回归安全兜底。评分调度不是严格轮询，旧测试关于“固定第一账号”和“四次必覆盖”的断言必须改成可确定的状态/唯一候选测试。账号池 `pool.go` 中重复身份多槽仍存在，AC-P03 必须按物理身份排除而非槽位。现有工作树还包含 README/admin/main 等与本主题无关的用户改动：保留、不混入池提交。真实 Upstash/上游账号测试已停止；今后只有用户另行要求才恢复。

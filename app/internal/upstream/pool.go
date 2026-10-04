@@ -592,6 +592,14 @@ func (p *Pool) tryAcquireExcluding(ctx context.Context, excludedIdentity string)
 		}
 		ready = append(ready, pa)
 	}
+	// healthNow may naturally clear an expired park and synchronously fail
+	// its durable write during this scan. The entry check cannot cover that
+	// transition; recheck the sticky store latch before reserving any slot.
+	// ParkWriteFailed is an atomic read (no store mutex) under p.mu.
+	if p.cfg.ParkWriteFailed != nil && p.cfg.ParkWriteFailed() {
+		p.mu.Unlock()
+		return nil, ErrParkPersistence
+	}
 	if len(ready) > 0 {
 		best := ready[0]
 		bestScore := p.accountScore(best)
@@ -629,6 +637,12 @@ func (p *Pool) tryAcquireExcluding(ctx context.Context, excludedIdentity string)
 				break
 			}
 		}
+	}
+	// The terminal classification pass also calls healthNow; never return
+	// a harmless-looking availability result after a failed clear write.
+	if p.cfg.ParkWriteFailed != nil && p.cfg.ParkWriteFailed() {
+		p.mu.Unlock()
+		return nil, ErrParkPersistence
 	}
 	p.mu.Unlock()
 	if allGone {
