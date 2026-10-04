@@ -37,6 +37,13 @@
 - AC-P09：postJSON（包括建 session）收到 HTTP 非 200 的 biz 5 保留 mute_until；HTTP 503 的 JSON 成功空 envelope（无明确业务拒绝）作为服务故障可重试，明确 biz_code 或 outer code 的拒绝不可重试。只用本地 HTTP mock，不接真实服务。
 - AC-P10：建 session 失败发生在客户端输出前；安全 transport/HTTP 5xx 可以先在原有客户端预检重试一次，再按请求剩余次数切换另一物理身份；mute/auth/明确业务拒绝不可换号，不发送 completion，不超出请求尝试上限。Web search 和普通聊天均验证。
 
+## biz5 停用期限策略（本地 SDD，覆盖以上“按上游期限”表述）
+
+- 上游明确返回 biz_code=5 且 `mute_until` 可解析、在收到时仍为未来时，**本地** `park_until = mute_until + 1h`，无论登录、建会话、completion 的 HTTP 200／非 200 路径。上游时间戳保留原值供诊断；加成仅在写入池和持久化时做一次，不修改上游错误字段。HTTP 429 的 `Retry-After` 应指示本地恢复剩余时间（不是上游原截止）；缺失、解析失败或已过期的 `mute_until` 一律从收到时本地停用 **7 天**，不允许按旧 6h 过早复选。显式配置的测试冷却可短于生产默认值。
+- 账号身份在本地截止前不允许参与聊天或 websearch 的任何候选，配置 store 记录加成后的 `park_until`，重启加载后不登录停用账号；到期自然恢复并可重新入池。永久 ban 无截止也不自动恢复。
+- 同一错误可能先由 `AccountManager.markBan` 再由 `Lease.NoteError` 处理；两入口不得重复加成，同一截止重复上报也不得延长一小时。并发迟到的更短截止不得缩短已知期限；持久回调不能将较长期限写回为短期。
+- 验收：httptest 的 HTTP 200／非 200 登录、会话、completion biz5；实际 SSE biz5 仅在当前解析器会把它分类成 biz5 时同样执行；解析秒数／字符串／RFC3339 和无效／已过期兜底；并发迟到、持久化重启跳过和到期复选。仅虚构身份、本地 store，不连真实 Redis／上游。
+
 ## TDD 顺序
 
 1. 表征既有 AC-P01/P02/P06，复跑 `go test ./internal/upstream ./internal/server -count=1`；已有通过项作为基线，不制造假 RED。

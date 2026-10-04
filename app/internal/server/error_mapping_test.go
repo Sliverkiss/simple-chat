@@ -43,7 +43,7 @@ func TestRiskDeviceMapsTo503UpstreamUnavailable(t *testing.T) {
 	}
 }
 
-// muted 429 carries Retry-After derived from the upstream mute_until.
+// muted 429 carries Retry-After derived from the local mute deadline.
 func TestMuted429CarriesRetryAfterFromMuteUntil(t *testing.T) {
 	until := time.Now().Add(2 * time.Minute).Unix()
 	up := httptest.NewServer(ladderMux(t, func(w http.ResponseWriter, r *http.Request) {
@@ -71,8 +71,8 @@ func TestMuted429CarriesRetryAfterFromMuteUntil(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Retry-After not an integer: %q", ra)
 	}
-	if secs < 60 || secs > 130 {
-		t.Errorf("Retry-After = %d, want ~120 (from mute_until)", secs)
+	if secs < 3650 || secs > 3730 {
+		t.Errorf("Retry-After = %d, want ~3720 (mute_until + 1h)", secs)
 	}
 }
 
@@ -94,8 +94,9 @@ func TestMuted429WithoutMuteUntilHasFallbackRetryAfter(t *testing.T) {
 	if resp.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429", resp.StatusCode)
 	}
-	if resp.Header.Get("Retry-After") == "" {
-		t.Error("muted 429 must carry a Retry-After even without mute_until")
+	secs, err := strconv.Atoi(resp.Header.Get("Retry-After"))
+	if err != nil || secs < 7*24*3600-10 || secs > 7*24*3600+10 {
+		t.Errorf("muted without mute_until Retry-After = %q, want ~7 days", resp.Header.Get("Retry-After"))
 	}
 }
 

@@ -32,6 +32,9 @@ func TestNon200CompletionMuteParksIdentity(t *testing.T) {
 	defer up.Close()
 	path := accountsFileAt(t, &upstream.Account{Mobile: "13800000000", Password: "fixture"})
 	accounts := mustLoadAccounts(t, path)
+	if err := writeAccountsFile(path, accounts[:1], 0600); err != nil {
+		t.Fatal(err)
+	}
 	srv, err := NewServer(Config{UpstreamBase: up.URL, Accounts: accounts[:1], ParkStore: jsonStoreFor(path), QueueWait: time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
@@ -59,8 +62,8 @@ func TestNon200CompletionMuteParksIdentity(t *testing.T) {
 		t.Fatalf("park=%+v, want mute until %s", stored, until)
 	}
 	parkUntil, err := time.Parse(time.RFC3339, stored.ParkUntil)
-	if err != nil || !parkUntil.Equal(until) {
-		t.Fatalf("park_until=%q, want %s (err=%v)", stored.ParkUntil, until, err)
+	if err != nil || !parkUntil.Equal(until.Add(time.Hour)) {
+		t.Fatalf("park_until=%q, want %s (err=%v)", stored.ParkUntil, until.Add(time.Hour), err)
 	}
 	resp, err = http.Post(gw.URL+"/v1/chat/completions", "application/json", strings.NewReader(switchRequest))
 	if err != nil {
@@ -72,6 +75,25 @@ func TestNon200CompletionMuteParksIdentity(t *testing.T) {
 	mu.Unlock()
 	if n != 1 {
 		t.Fatalf("muted account reused: hits=%d", n)
+	}
+	// Reload the actual persisted grace deadline: no login, session, or
+	// completion may reach the upstream while that deadline is still future.
+	restarted, err := NewServer(Config{UpstreamBase: up.URL, Accounts: mustLoadAccounts(t, path), ParkStore: jsonStoreFor(path), QueueWait: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Shutdown()
+	gate := httptest.NewServer(restarted.Handler())
+	defer gate.Close()
+	status, _ := postHi(t, gate.URL)
+	if status == http.StatusOK {
+		t.Fatal("restarted muted account selected")
+	}
+	mu.Lock()
+	n = hits
+	mu.Unlock()
+	if n != 1 {
+		t.Fatalf("restarted muted account contacted upstream: completions=%d", n)
 	}
 }
 
