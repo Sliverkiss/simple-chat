@@ -97,4 +97,11 @@
 - **无法保证的启动边界**：若写失败后崩溃或重启，内存停放与锁存均丢失；Redis 若仍保留旧 ready 行，下一进程无法凭空恢复失落 mute，可能重新选择。跨此边界保证需先完成可靠落盘／外部持久故障标记或在重新接流量前人工核对。本次不增加 schema、全局阈值或分布式锁；一个 Redis 实例不等于多个应用实例。
 - 本地 TDD：`app/internal/server/park_failclosed_test.go` 虚构账号／失败 backing 的 RED 复现热重建后新租约；GREEN 验证同进程拒绝新 lease、聊天 503、health 503，backing 仍为 ready（因此不能推断重启安全）。不连真实 Redis／上游。
 
+### OP-05 Redis 已连接但不应答（本地增量验收）
+
+- 假 RESP 对端接收停放 `SET` 后不回包：停放回调有限返回，结果未知不得视为成功；当前进程锁存准入关闭，即使热替换为看似健康账号，新 lease、聊天、Web 搜索与 `/healthz` 均拒绝（后三者 HTTP 503）。无需真实凭据／Redis。
+- RESP 单条命令写入及完整回包共用 **2 秒** deadline（包括启动 AUTH/PING、关闭 QUIT）；超时或不完整响应即丢弃连接，可能已经执行的 `SET`/`SADD`/`SREM`/`DEL` **不自动重放**，后续独立命令可以重拨。连接建立仍受原有 dial 5 秒限制，且握手命令分别计时，不是端到端请求总超时。
+- `NoteError` 在 pool/account 锁内同步写回，其他需这些锁的请求可能额外等待在途 IO；一个已连接且无回包的命令至多等待上述 2 秒，但并发排队、多个串行命令／重拨以及系统调度不保证全局 wall-clock 上界。超时后的故障锁存不会在重拨成功时自行解除。崩溃后仍受上节已声明的重启缺口约束。
+- TDD 证据：`TestRESPStalledWriteReplyTimesOutWithoutReplay` RED 为 `SET waited without bound for Redis reply`（3.00s），GREEN 在约 2.00s 返回并断开；`TestRESPStalledCommandWriteTimesOut` 验证写卡住同样有限返回，`TestOP05StalledRedisParkClosesAdmission` 用本地 RESP + 实际 store/pool/HTTP 路径验证 503。`go test ./... -count=1 -timeout=300s`、`go test -race ./... -count=1 -timeout=300s`、`go vet ./...`、`go build ./...` 和 `git diff --check` 通过；仅是离线协议/单进程验证。
+
 预工具基线的 retry ladder 原本允许单账号部分错误重新尝试；账户排除必须不回归安全兜底。评分调度不是严格轮询，旧测试关于“固定第一账号”和“四次必覆盖”的断言必须改成可确定的状态/唯一候选测试。账号池 `pool.go` 中重复身份多槽仍存在，AC-P03 必须按物理身份排除而非槽位。现有工作树还包含 README/admin/main 等与本主题无关的用户改动：保留、不混入池提交。真实 Upstash/上游账号测试已停止；今后只有用户另行要求才恢复。

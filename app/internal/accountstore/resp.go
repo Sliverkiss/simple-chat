@@ -41,6 +41,10 @@ type respConn struct {
 // errClosed marks a broken connection so the next command re-dials.
 var errClosed = errors.New("redis: connection closed")
 
+// Bound each command (including AUTH/PING and best-effort QUIT). A missing
+// reply leaves write execution uncertain: discard the socket, never replay.
+const redisCommandTimeout = 2 * time.Second
+
 // parseRedisURL parses redis:// and rediss:// connection strings into dial
 // parameters. A password in the URL is the AUTH password (a "user:pass"
 // form sends AUTH <user> <pass>; user "default" degrades to AUTH <pass>).
@@ -102,14 +106,6 @@ func (c *respConn) do(args ...string) (any, error) {
 		}
 	}
 	reply, err := c.roundTripLocked(args)
-	if errors.Is(err, errClosed) {
-		// One re-dial attempt per command: a transient broken pipe heals on
-		// the next call instead of bricking the store.
-		if err := c.dialLocked(); err != nil {
-			return nil, err
-		}
-		return c.roundTripLocked(args)
-	}
 	return reply, err
 }
 
@@ -160,18 +156,36 @@ func (c *respConn) doPing() error {
 // roundTripLocked writes args as one RESP array and reads one reply.
 // Caller holds c.mu.
 func (c *respConn) roundTripLocked(args []string) (any, error) {
+	if err := c.conn.SetDeadline(time.Now().Add(redisCommandTimeout)); err != nil {
+		c.closeLocked()
+		return nil, fmt.Errorf("redis: set command deadline: %w", err)
+	}
+	defer func() {
+		if c.conn != nil {
+			_ = c.conn.SetDeadline(time.Time{})
+		}
+	}()
 	var b strings.Builder
 	fmt.Fprintf(&b, "*%d\r\n", len(args))
 	for _, a := range args {
 		fmt.Fprintf(&b, "$%d\r\n%s\r\n", len(a), a)
 	}
 	if _, err := c.w.WriteString(b.String()); err != nil {
-		return nil, errClosed
+		c.closeLocked()
+		return nil, fmt.Errorf("redis: write command: %w", err)
 	}
 	if err := c.w.Flush(); err != nil {
-		return nil, errClosed
+		c.closeLocked()
+		return nil, fmt.Errorf("redis: flush command: %w", err)
 	}
-	return readReply(c.r)
+	reply, err := readReply(c.r)
+	if err != nil {
+		// A server error reply is a valid protocol response, but all other
+		// failures may leave buffered bytes that would poison the next reply.
+		c.closeLocked()
+		return nil, err
+	}
+	return reply, nil
 }
 
 // closeLocked tears down the connection. Caller holds c.mu.
@@ -201,7 +215,7 @@ func (c *respConn) Close() error {
 func readReply(r *bufio.Reader) (any, error) {
 	line, err := readLine(r)
 	if err != nil {
-		return nil, errClosed
+		return nil, fmt.Errorf("%w: read reply: %w", errClosed, err)
 	}
 	if len(line) < 1 {
 		return nil, errors.New("redis: empty reply line")
@@ -228,7 +242,7 @@ func readReply(r *bufio.Reader) (any, error) {
 		}
 		buf := make([]byte, n+2) // payload + \r\n
 		if _, err := io.ReadFull(r, buf); err != nil {
-			return nil, errClosed
+			return nil, fmt.Errorf("%w: read bulk reply: %w", errClosed, err)
 		}
 		return string(buf[:n]), nil
 	case '*':
