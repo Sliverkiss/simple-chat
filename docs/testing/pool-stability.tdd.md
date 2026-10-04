@@ -13,4 +13,8 @@
 
 - 重试期间候选消失 RED→GREEN `2c460e8`：本地 mock 在首次空结果后移除或停用唯一账号，覆盖流式/非流式；此前第二次会报笼统 pool_failure，修复后不再发起第二次 completion，返回 `503 no_eligible_account`，诊断逐次为 `empty_output`、`no_eligible_account`，且不会记录 nil upstream error。`go test ./internal/server -run '^TestEmptyRetryNoEligibleAccountTerminates$' -count=2`、全量、全量 race、vet、build 与 diff 检查通过。
 
+- 本轮 mute 核查（仅本地）：基线 `go test ./internal/upstream ./internal/server -count=1 -timeout=300s` 均通过。`TestFirstDiscoveredMuteExcludedFromLaterSwitches` 首次即 GREEN：初次 biz 5 的同一请求返回 429、completion 仅一次，持久记录变 muted；后续请求只走健康 B。既有 `TestRestartKeepsParkedAccountFrozen` 证明已持久 mute 重启后零上游调用；不能据此推论之前两个初始 ready 的真实账号是已知 mute 被选。
+- 并发迟到窗口新 RED：`go test ./internal/upstream -run '^TestConcurrentLeaseLateMuteDoesNotShortenKnownPark$' -count=1 -v` 报 `late in-flight error shortened known mute`，较短迟到 biz 5 将已知长窗口缩短。第二次 RED 注入真实 `AccountManager.markBan → Lease.NoteError` 顺序，确认只在 `NoteError` 修正不够；最小 GREEN 在 manager 与 lease 两层阻止更短 mute 覆盖、更永久 ban 维持优先。单测 GREEN；全量 `go test ./... -count=1 -timeout=300s`、`go test -race ./... -count=1 -timeout=300s`、`go vet ./...`、`go build ./...`、`git diff --check` 均退出 0。未请求真实 Redis／上游。
+- 残余风险：在途 lease 可在停用前已发起上游请求；若生产存储写失败或实例之间未同步 park，本地单进程测试不保证跨实例即时一致。
+
 已覆盖：AC-P01/P02/P06 既有池和持久态测试，以及重复身份共享容量/停用与热删重建；AC-P03/P04 同一 prompt、独立 session、身份切换与安全兜底 mock；AC-P05 已可见 SSE 片段后不切换、裸 EOF 不报正常结束；AC-P07 内容过滤诊断。监听范围按用户纠正仅约束测试，不约束部署。限制：未做真实服务请求；AC-P07 的所有诊断细分仍需单独验收。测试不证明两个健康账号严格轮询或固定频率；评分调度本来不承诺这些性质。

@@ -17,6 +17,20 @@
 - AC-P07 日志：脱敏 identity、尝试次数、排队时间、终止原因、输入输出/总 tokens 和可测速度；无 usage 标 unknown，不打印密码/token/完整 prompt。日志只声称实际已观察终态。
 监听策略：测试启动时显式使用 `127.0.0.1`，不运行真实账号请求；部署环境保留可配置监听地址，不把本地测试约束写成生产限制。`app/.env` 忽略并保留，任何提交不得包含真实账号或 Redis 凭据。
 
+## Mute 切换的独立规格（本地验收）
+
+已知 mute 指账户存储中 `park_kind=muted` 且 `park_until` 在未来，或一次请求已得到 biz_code=5 并由 `NoteError` 停用的身份；首次探测 mute 指此前为 ready、直到本次上游返回 biz_code=5 才知其不可用。不能将“先前 ready、连续首次探测变 mute”的多个身份误认为已标记 mute 被调度。
+
+| 场景 | 同一请求 | 后续请求／重启 | 验收证据 |
+|---|---|---|---|
+| 启动已知 mute，另有 ready | 只选 ready，不登录 mute | 截止前始终不选 mute | mock 记录每身份全部请求为零 |
+| 首次 completion/login/session 返回 biz 5 | 本次报 mute，不把 biz 5 当可重试故障换 B | 已标记身份从候选中排除；配置 store 时写入并重启恢复 | mock 计数、池快照、store 字段 |
+| A、B 原先都 ready，先后各自首次命中 mute | 每个请求可分别失败一次 | A 在标记后不再被选；B 也在标记后不再被选 | 按身份区分的请求计数，非固定轮询 |
+| 同身份并发 lease，A 先返回 mute | 已发出的 lease 不可撤销；待它完成后不再分配新 lease | 无新的登录/session/completion 发往停用身份；重复槽共享停用态 | barrier 测试并发在途与新 Acquire |
+| 过期 mute | 不在过期前试探 | 到期自然恢复并清除持久 park | 受控期限与存储回读 |
+
+排查前提：本地直接 `NewPool` 若未配置 `OnParkPersist`，不能据此断言生产 Redis 未写；生产通过 `main.go → server.NewServer(ParkStore)` 配置写入回调。所有验证仅使用固定虚构凭据、httptest 和本地 store，不触碰真实上游/Redis。若现有行为满足上述矩阵，只补表征测试和证据，不制造假 RED 或改风控参数。
+
 ## TDD 顺序
 
 1. 表征既有 AC-P01/P02/P06，复跑 `go test ./internal/upstream ./internal/server -count=1`；已有通过项作为基线，不制造假 RED。

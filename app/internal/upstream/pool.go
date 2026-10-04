@@ -698,6 +698,11 @@ func (l *Lease) NoteError(err error) {
 		if until.IsZero() || until.Before(time.Now()) {
 			until = time.Now().Add(l.pool.cfg.MuteParkDefault)
 		}
+		// Concurrent leases may report older/shorter mute windows out of
+		// order. Never make a known mute eligible sooner.
+		if l.pa.am.ban == BanMuted && l.pa.am.parkUntil.After(until) {
+			return
+		}
 		l.pa.am.ban = BanMuted
 		l.pa.am.parkUntil = until
 		l.pa.am.banMsg = "account muted: " + err.Error()

@@ -1182,6 +1182,9 @@ func (am *AccountManager) fireStartupSequence(tok string) {
 
 // markBan records ban/mute states from an upstream error.
 func (am *AccountManager) markBan(err error) {
+	if am.ban == BanBanned {
+		return
+	}
 	be, _ := err.(*BizError)
 	switch BanKind(err) {
 	case BanBanned:
@@ -1189,7 +1192,6 @@ func (am *AccountManager) markBan(err error) {
 		am.parkUntil = time.Time{}
 		am.banMsg = "account banned: " + err.Error()
 	case BanMuted:
-		am.ban = BanMuted
 		until := time.Time{}
 		if be != nil {
 			until = be.MuteUntil
@@ -1201,6 +1203,10 @@ func (am *AccountManager) markBan(err error) {
 			}
 			until = time.Now().Add(duration)
 		}
+		if am.ban == BanMuted && am.parkUntil.After(until) {
+			return
+		}
+		am.ban = BanMuted
 		am.parkUntil = until
 		am.banMsg = "account muted: " + err.Error()
 	case BanRiskDevice:
