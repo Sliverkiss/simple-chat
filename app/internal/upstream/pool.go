@@ -144,8 +144,8 @@ func ParkKindName(b BanState) string { return parkKindNames[b] }
 func ParseParkKind(s string) BanState { return parkKindsByString[s] }
 
 // parsePersistedPark reads an account's park_* fields into (kind, until).
-// A garbage until is treated as absent — an unparseable window must not
-// brick the account, and ParseParkKind already rejects garbage kinds.
+// A missing or unparseable until remains a park with unknown recovery. The
+// store must not erase it, and admission must not invent a new deadline.
 func parsePersistedPark(a Account) (BanState, time.Time) {
 	kind := ParseParkKind(a.ParkKind)
 	if kind == BanNone {
@@ -326,13 +326,17 @@ func (p *Pool) buildAccount(a Account) (*poolAccount, error) {
 		pa.am.banMsg = a.ParkReason
 		pa.am.mu.Unlock()
 		p.logf("pool: account still BANNED (restored from disk; manual revive = delete park fields from accounts.json)")
-	} else if kind != BanNone && !until.IsZero() && !time.Now().After(until) {
+	} else if kind != BanNone && (until.IsZero() || time.Now().Before(until)) {
 		pa.am.mu.Lock()
 		pa.am.ban = kind
 		pa.am.parkUntil = until
 		pa.am.banMsg = a.ParkReason
 		pa.am.mu.Unlock()
-		p.logf("pool: account still %s until %s (restored from disk)", banName(kind), until.Format(time.RFC3339))
+		if until.IsZero() {
+			p.logf("pool: account still %s with unknown recovery (restored from disk)", banName(kind))
+		} else {
+			p.logf("pool: account still %s until %s (restored from disk)", banName(kind), until.Format(time.RFC3339))
+		}
 	}
 	return pa, nil
 }
@@ -340,7 +344,7 @@ func (p *Pool) buildAccount(a Account) (*poolAccount, error) {
 // joinIdentity shares one runtime state per physical identity. Called only
 // under p.mu (or during construction before the pool is published). A parked
 // duplicate from persistence must not resurrect a ready copy: a permanent ban
-// wins, otherwise keep the later timed window (regardless of park kind).
+// wins, then an unknown recovery deadline, then the later timed window.
 // Equal deadlines prefer mute over risk, then lexicographically later reason.
 func (p *Pool) joinIdentity(pa *poolAccount) error {
 	for _, existing := range p.accounts {
@@ -364,7 +368,8 @@ func (p *Pool) joinIdentity(pa *poolAccount) error {
 		if kind == BanBanned && (existing.am.ban != BanBanned || reason > existing.am.banMsg) ||
 			kind != BanNone && existing.am.ban == BanNone ||
 			kind != BanNone && kind != BanBanned && existing.am.ban != BanBanned &&
-				(until.After(existing.am.parkUntil) ||
+				(until.IsZero() && !existing.am.parkUntil.IsZero() ||
+					until.After(existing.am.parkUntil) && !existing.am.parkUntil.IsZero() ||
 					until.Equal(existing.am.parkUntil) && (kind == BanMuted && existing.am.ban == BanRiskDevice ||
 						kind == existing.am.ban && reason > existing.am.banMsg)) {
 			existing.am.ban, existing.am.parkUntil, existing.am.banMsg = kind, until, reason
@@ -746,6 +751,11 @@ func (l *Lease) NoteError(err error) {
 		return
 	}
 	if l.pa.am.ban == BanBanned && BanKind(err) != BanBanned {
+		return
+	}
+	// An existing unknown recovery time must not be replaced by a newly
+	// computed fallback (or risk cooldown) from a late in-flight error.
+	if (l.pa.am.ban == BanMuted || l.pa.am.ban == BanRiskDevice) && l.pa.am.parkUntil.IsZero() && BanKind(err) != BanBanned {
 		return
 	}
 	switch BanKind(err) {

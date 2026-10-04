@@ -1220,6 +1220,11 @@ func (am *AccountManager) markBan(err error) {
 	if am.ban == BanBanned {
 		return
 	}
+	// A restored mute/risk with no trustworthy deadline cannot be replaced
+	// by a fresh relative fallback. Only a permanent ban can supersede it.
+	if (am.ban == BanMuted || am.ban == BanRiskDevice) && am.parkUntil.IsZero() && BanKind(err) != BanBanned {
+		return
+	}
 	be, _ := err.(*BizError)
 	switch BanKind(err) {
 	case BanBanned:

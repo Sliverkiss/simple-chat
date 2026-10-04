@@ -31,6 +31,14 @@
 
 OP-06 本地 TDD：修改原 HTTP 表征先见 RED（all_muted 得 `pool_busy`，耗尽 QueueWait 而不是 `pool_parked`）；实施后扩展聊天、搜索混合 ban/mute/risk、全 risk、全 cooldown、全忙及缺失 mute 截止的 fallback。deadline 在选择期间到期的包级 RED 曾返回过时 parked，复查后 GREEN。未知截止的包级测试及 HTTP 映射测试均通过。全量 `go test ./... -count=1 -timeout=300s`、race 同命令、`go vet ./...`、`go build ./...` 通过；旧包级断言 `ErrPoolBusy` 已按新的有期限 park 类型更新。无真实 Redis 或生产流量验收。
 
+### OP-01/04/06 补充：损坏持久停放期限（本地 SDD）
+
+已有 `park_kind=muted|risk`、但 `park_until` 缺失或不是 RFC3339 的行，不能按“已过期”清理，也不能在启动时给它重新生成 7 天/10 分钟期限。保留原始持久行的 kind/原因/时间字段；池恢复为同 kind、未知截止，禁止发新 lease。与同一物理身份的已知截止副本合并时未知截止优先（永久 ban 仍优先）；迟到的非永久业务错误不得把未知截止改为新的相对期限。真正有可解析、已过期截止的 mute/risk 继续清理并自然恢复。
+
+验收：使用本地假 RESP Redis 和 0600 JSON fixture，连续启动加载后回读原行不被改写、租约拒绝；唯一此类身份时聊天和 Web 搜索均不得发任何上游请求，立即返回 `503 no_eligible_account` 且不附 `Retry-After`。重复身份顺序无关；不接真实账号或 Redis，不改 schema/用户期限阈值。
+
+TDD 证据：先新增 `TestInvalidParkDeadlineLoadPreservesQuarantine`，在原基线执行 `go test ./internal/accountstore -run '^TestInvalidParkDeadlineLoadPreservesQuarantine$' -count=1`，8 个 JSON/假 RESP Redis 子例均 RED：加载时 `ParkKind` 已被清空。原基线 `TestInvalidPersistedParkHTTPFailsClosed` RED：`mustLoadAccounts` 返回已清理的 ready 行；`TestPersistedUnknownParkOverridesTimedDuplicate` RED 为 `PoolParkedError`（而非未知期限），`TestUnknownParkIsNotReplacedByNewFallback` RED 为新生成 7 天期限。最小修复后新增迟到错误和健康身份路径，目标包测试、全量 `go test ./... -count=1 -timeout=300s`、race 同命令、`go vet ./...`、`go build ./...` 和 `git diff --check` 均通过。仅离线模拟，没有真实 Redis/账号验收。
+
 ## 可观测验收矩阵
 
 - AC-P01 调度：健康且有空位候选按评分近优选取；分数考虑 in-flight 占比和 EWMA；禁用/封禁/冷却账户绝不入选；两个相近健康账户无需固定轮流或真均匀随机。用 fake clock/确定性 PRNG 或强制唯一候选做状态断言，不以四次抽样必须覆盖全部账户作断言。

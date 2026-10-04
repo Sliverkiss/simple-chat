@@ -26,8 +26,9 @@ var ErrAccountNotFound = errors.New("accountstore: account not found")
 // Store persists account state across restarts.
 type Store interface {
 	// Load returns every persisted account (full records, credentials
-	// included). Expired mute/risk parks are stripped (and the stripping
-	// persisted) before the accounts are returned; banned survives forever.
+	// included). Only mute/risk parks with a parseable elapsed deadline are
+	// stripped and persisted; missing/invalid deadlines remain parked with
+	// unknown recovery. Banned survives forever.
 	Load(ctx context.Context) ([]upstream.Account, error)
 	// SaveAccount upserts one account's persisted state (device id, park
 	// fields — the whole record). Duplicate rows for one identity follow the
@@ -68,16 +69,16 @@ func applyParkRecord(acct *upstream.Account, rec upstream.ParkRecord, now time.T
 	return true
 }
 
-// parkExpired reports whether acct carries a mute/risk park whose window has
-// lapsed (or whose until is unparseable — fail-safe: treat as expired). A
-// garbage until must not brick the account. Banned never expires.
+// parkExpired reports whether a mute/risk park has a parseable deadline that
+// has elapsed. Missing or corrupt deadlines have unknown recovery and must
+// remain parked; clearing them would admit a disabled identity on restart.
 func parkExpired(acct upstream.Account, now time.Time) bool {
 	kind := upstream.ParseParkKind(acct.ParkKind)
 	if kind != upstream.BanMuted && kind != upstream.BanRiskDevice {
 		return false
 	}
 	until, err := time.Parse(time.RFC3339, acct.ParkUntil)
-	return err != nil || now.After(until)
+	return err == nil && !now.Before(until)
 }
 
 // EnsureDeviceIDs resolves and persists every account's device identity:

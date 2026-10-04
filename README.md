@@ -142,8 +142,11 @@ earliest local recovery deadline (not a promise of capacity). A ready account
 at capacity still waits for `QueueWait` and returns `429 pool_busy`; all
 permanently banned/empty pools return `503 no_accounts`. If recovery timing is
 unknown, the response is `503 no_eligible_account` without `Retry-After`.
-Clients that previously interpreted every pool-level 429 as `pool_busy` should
-handle `pool_parked` separately.
+A stored mute/risk row with missing or malformed `park_until` remains disabled
+across restarts (no guessed recovery date); repair its persisted park fields
+only after verifying the account's actual upstream status. Clients that
+previously interpreted every pool-level 429 as `pool_busy` should handle
+`pool_parked` separately.
 
 ## 🛠️ Admin API (account management)
 

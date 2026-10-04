@@ -173,8 +173,8 @@ func TestJSONStoreClearExpiredParks(t *testing.T) {
 	if accts[2].ParkKind != "banned" {
 		t.Errorf("banned wrongly cleared: %+v", accts[2])
 	}
-	if accts[3].ParkKind != "" {
-		t.Errorf("garbage until must be cleared (fail-safe): %+v", accts[3])
+	if accts[3].ParkKind != "muted" || accts[3].ParkUntil != "garbage" || accts[3].ParkReason != "broken" {
+		t.Errorf("garbage until must remain parked with unknown recovery: %+v", accts[3])
 	}
 	if accts[4].ParkKind != "" {
 		t.Errorf("clean account touched: %+v", accts[4])
