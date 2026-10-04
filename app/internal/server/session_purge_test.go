@@ -307,15 +307,15 @@ func TestPurgeLoopFiresOnShortDelay(t *testing.T) {
 	f := newCleanupFixture(t)
 	gw, ts := newCleanupServer(t, f.srv.URL, func(c *Config) {
 		c.PurgeEnabled = true
-		c.PurgeWeekday = 6
+		// Schedule the normal slot for tomorrow: startup catch-up is a
+		// separate, legitimate purge and must not race the injected wake.
+		// Go's Sunday=0 maps to config Monday=0 for tomorrow.
+		c.PurgeWeekday = int(time.Now().Weekday())
 		c.PurgeHour = 4
-		// Shrink the startup catch-up delay: the machine's clock may
-		// sit right after a missed Sunday-04:00 slot (e.g. testing on
-		// Sunday morning), and the production 2-12s catch-up sleep
-		// would starve the 5s deadline.
-		c.PurgeCatchUpMin = time.Millisecond
-		c.PurgeCatchUpMax = 2 * time.Millisecond
 	})
+	if gw.purge.catchUpNeeded(time.Now()) {
+		t.Fatal("short-delay test unexpectedly has a startup catch-up slot")
+	}
 	for i := 0; i < 5; i++ {
 		postOneChat(t, ts.URL)
 	}
