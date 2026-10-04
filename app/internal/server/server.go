@@ -344,6 +344,10 @@ func (s *Server) runWebSearchAttempt(ctx context.Context, w http.ResponseWriter,
 	sessionID, err := lease.CreateSession(ctx)
 	if err != nil {
 		lease.NoteError(err)
+		if attempt < maxAttempts && ctx.Err() == nil && upstream.IsRetryable(err) {
+			previous.err, previous.allowSameAccount = err, true
+			return true
+		}
 		s.writeUpstreamError(w, err)
 		return false
 	}
@@ -561,8 +565,12 @@ func (s *Server) runAttempt(ctx context.Context, w http.ResponseWriter, req *ope
 	sessionID, err := lease.CreateSession(ctx)
 	if err != nil {
 		lease.NoteError(err)
-		s.writeUpstreamError(w, err)
 		termination = "session_error"
+		if attempt < maxAttempts && ctx.Err() == nil && upstream.IsRetryable(err) {
+			previous.err, previous.allowSameAccount = err, true
+			return true
+		}
+		s.writeUpstreamError(w, err)
 		return false
 	}
 	s.sessions.record(lease.Account().Mobile, sessionID, lease.Client(), tok)

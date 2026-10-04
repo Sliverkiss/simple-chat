@@ -301,6 +301,9 @@ func IsAuthFailure(err error) bool {
 	if !ok {
 		return false
 	}
+	if BanKind(err) != BanNone {
+		return false
+	}
 	if be.HTTPStatus == http.StatusUnauthorized || be.HTTPStatus == http.StatusForbidden {
 		return true
 	}
@@ -376,10 +379,19 @@ func (c *Client) postJSON(ctx context.Context, path string, token string, body a
 		return envelope{}, err
 	}
 	if err := json.Unmarshal(data, &env); err != nil {
+		if resp.StatusCode >= 500 {
+			return envelope{}, &HTTPStatusError{Status: resp.StatusCode, Snippet: string(data)}
+		}
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			return envelope{}, &BizError{HTTPStatus: resp.StatusCode}
+		}
 		return envelope{}, fmt.Errorf("upstream: bad JSON from %s (http %d): %.200s", path, resp.StatusCode, data)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return env, &BizError{HTTPStatus: resp.StatusCode, Code: env.Code, Msg: env.Msg, BizCode: env.Data.BizCode, BizMsg: env.Data.BizMsg}
+		if env.Code == 0 && env.Data.BizCode == 0 && resp.StatusCode >= 500 {
+			return env, &HTTPStatusError{Status: resp.StatusCode, Snippet: string(data)}
+		}
+		return env, &BizError{HTTPStatus: resp.StatusCode, Code: env.Code, Msg: env.Msg, BizCode: env.Data.BizCode, BizMsg: env.Data.BizMsg, MuteUntil: parseMuteUntil(env.Data.BizData)}
 	}
 	return env, nil
 }
@@ -703,6 +715,13 @@ func (c *Client) Completion(ctx context.Context, token string, req CompletionReq
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		var env envelope
+		if json.Unmarshal(raw, &env) == nil && (env.Code != 0 || env.Data.BizCode != 0) {
+			return nil, &BizError{HTTPStatus: resp.StatusCode, Code: env.Code, Msg: env.Msg, BizCode: env.Data.BizCode, BizMsg: env.Data.BizMsg, MuteUntil: parseMuteUntil(env.Data.BizData)}
+		}
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			return nil, &BizError{HTTPStatus: resp.StatusCode}
+		}
 		return nil, &HTTPStatusError{Status: resp.StatusCode, Snippet: string(raw)}
 	}
 	// The upstream may answer errors as JSON with HTTP 200 on this endpoint;
