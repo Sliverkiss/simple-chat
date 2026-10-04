@@ -680,14 +680,18 @@ func (l *Lease) NoteError(err error) {
 	defer l.pool.mu.Unlock()
 	l.pa.am.mu.Lock()
 	defer l.pa.am.mu.Unlock()
-	// A permanent ban wins over delayed mute/risk responses from leases
-	// acquired before the ban; never replace the durable park record.
-	if l.pa.am.ban == BanBanned {
+	// The manager may have observed this very ban while executing the lease's
+	// upstream call. Its in-memory transition still needs one durable write.
+	if l.pa.am.ban == BanBanned && !l.pa.am.banParkPending {
+		return
+	}
+	if l.pa.am.ban == BanBanned && BanKind(err) != BanBanned {
 		return
 	}
 	switch BanKind(err) {
 	case BanBanned:
 		l.pa.am.ban = BanBanned
+		l.pa.am.banParkPending = false
 		l.pa.am.parkUntil = time.Time{}
 		l.pa.am.banMsg = "account banned: " + err.Error()
 	case BanMuted:
@@ -700,15 +704,19 @@ func (l *Lease) NoteError(err error) {
 		}
 		// Concurrent leases may report older/shorter mute windows out of
 		// order. Never make a known mute eligible sooner.
-		if l.pa.am.ban == BanMuted && l.pa.am.parkUntil.After(until) {
+		if l.pa.am.ban != BanNone && l.pa.am.parkUntil.After(until) {
 			return
 		}
 		l.pa.am.ban = BanMuted
 		l.pa.am.parkUntil = until
 		l.pa.am.banMsg = "account muted: " + err.Error()
 	case BanRiskDevice:
+		until := time.Now().Add(l.pool.cfg.RiskCooldown)
+		if l.pa.am.ban != BanNone && l.pa.am.parkUntil.After(until) {
+			return
+		}
 		l.pa.am.ban = BanRiskDevice
-		l.pa.am.parkUntil = time.Now().Add(l.pool.cfg.RiskCooldown)
+		l.pa.am.parkUntil = until
 		l.pa.am.banMsg = "risk device detected: " + err.Error()
 	}
 	if l.pool.cfg.Logger != nil {

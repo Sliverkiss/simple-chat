@@ -37,6 +37,13 @@
 - AC-P09：postJSON（包括建 session）收到 HTTP 非 200 的 biz 5 保留 mute_until；HTTP 503 的 JSON 成功空 envelope（无明确业务拒绝）作为服务故障可重试，明确 biz_code 或 outer code 的拒绝不可重试。只用本地 HTTP mock，不接真实服务。
 - AC-P10：建 session 失败发生在客户端输出前；安全 transport/HTTP 5xx 可以先在原有客户端预检重试一次，再按请求剩余次数切换另一物理身份；mute/auth/明确业务拒绝不可换号，不发送 completion，不超出请求尝试上限。Web search 和普通聊天均验证。
 
+## 永久 ban 写入与迟到 risk 单调期限（独立验收）
+
+- AC-P11：上游 biz 10 在登录／建会话／completion 经 `AccountManager.markBan` 预先置永久 ban 后，lease 的 `NoteError` 必须恰好一次写入 `OnParkPersist`；再次通知不得重复。用本地 mock 走真实 manager 调用和回调，重建池后 ban 仍不可选；迟到 mute/risk 不得降级或覆盖持久 ban。直接 `NoteError` ban 同样保持一次写入。
+- AC-P12：同一身份并发在途错误乱序到达时，已有较晚 mute 不得被较短 risk 改写（manager 和 lease 两层均须保持原 kind、期限）；跨 kind 的已知 park 期限只能延长不能缩短，短消息不得发出覆盖持久化；永久 ban 永远优先。只用虚构账户与确定期限，不改变 mute 加 1h／无截止 7 天策略。
+
+本轮 TDD 证据（`app/internal/upstream/pool_park_monotonic_test.go`）：RED 执行 `go test ./internal/upstream -run 'TestManagerBanIsPersistedExactlyOnceByLease|TestParkDeadlineMonotonicAcrossKinds' -count=1`，分别失败于 `ban persistence = []` 与两个跨 kind 的 manager 期限缩短；GREEN 同命令通过，增加 manager 预置 ban 后迟到错误测试通过。`go test ./... -count=1 -timeout=300s`、`go test -race ./... -count=1 -timeout=300s`、`go vet ./...`、`go build ./...`、`git diff --check` 均通过。测试只覆盖 mock，无真实账户／Redis 验证；ban 持久化依赖调用方将业务错误交给 lease `NoteError`。
+
 ## TDD 顺序
 
 1. 表征既有 AC-P01/P02/P06，复跑 `go test ./internal/upstream ./internal/server -count=1`；已有通过项作为基线，不制造假 RED。
