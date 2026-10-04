@@ -70,7 +70,7 @@ func newSwitchFixture(t *testing.T, failure string) *switchFixture {
 		f.calls = append(f.calls, switchCall{identity, body.Session, body.Prompt})
 		n := len(f.calls)
 		f.mu.Unlock()
-		if n == 1 {
+		if n == 1 && f.failure != "" {
 			switch f.failure {
 			case "parallel":
 				w.Header().Set("Content-Type", "text/event-stream")

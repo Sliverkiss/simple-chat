@@ -23,6 +23,12 @@
 
 **执行顺序**：先做 OP-01/03/04 的纵向闭环测试；若现有行为已满足，记录 GREEN 基线，不制造假 RED。若不满足，先见到该合同对应的 RED 再最小修复为 GREEN；再覆盖 OP-02/05/06。每一轮独立重跑完整测试、race、vet、build，逐项填证据与未覆盖项。离线闭环通过仅证明本地协议/状态机，不代替生产 Redis 与真实上游验证。
 
+### OP-02/06 本地 HTTP 表征与兼容性暂停
+
+`app/internal/server/pool_op0206_http_test.go` 经真实 handler + 本地假上游验证：占满 A 后 B 能服务；A 首字节前 HTTP 500 时，若 B 忙碌，仅等待设定的 QueueWait 并返回 `429 pool_busy`，不偷换回 A；现有切号/提交边界测试另覆盖安全换号、独立 session、可见 SSE delta 后不重放。首次探测 biz 5/10 各仅请求一次，不立即换号；全部永久 ban 返回 `503 no_accounts` 且不发上游请求；全部容量满返回 `429 pool_busy` + Retry-After。测试显式将 QueueWait 设为 40ms，只证明这个有界配置。
+
+**待决兼容行为（本轮不修改生产响应）**：全部 muted/risk/cooling 时，池当前把“无 ready 候选”也分类为 busy，按默认 QueueWait **30s** 排队后返回 `429 pool_busy` + Retry-After；与“容量耗尽”响应无法区分，`Retry-After` 不表示停放恢复期限。改成快速 `503 no_eligible_account` 或其它分类会改变既有 429/错误码契约，须先由调用方确认迁移方式。当前测试将这一行为明确标作兼容基线，不能称 OP-06 的全停放快返要求已完成。无真实 Redis/上游验收。
+
 ## 可观测验收矩阵
 
 - AC-P01 调度：健康且有空位候选按评分近优选取；分数考虑 in-flight 占比和 EWMA；禁用/封禁/冷却账户绝不入选；两个相近健康账户无需固定轮流或真均匀随机。用 fake clock/确定性 PRNG 或强制唯一候选做状态断言，不以四次抽样必须覆盖全部账户作断言。
