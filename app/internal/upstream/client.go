@@ -133,8 +133,6 @@ type Client struct {
 	// §11): x-device-id and x-rangers-id values, minted deterministically.
 	deviceProfile deviceProfile
 
-	powMu sync.Mutex // guards concurrent fresh-challenge fetches
-
 	amOnce sync.Once
 	am     *AccountManager
 }
